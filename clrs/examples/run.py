@@ -566,6 +566,7 @@ def main(unused_argv):
   current_train_items = [0] * len(FLAGS.algorithms)
   step = 0
   next_eval = 0
+  stop_early = False
   # Make sure scores improve on first step, but not overcome best score
   # until all algos have had at least one evaluation.
   val_scores = [-99999.9] * len(FLAGS.algorithms)
@@ -648,8 +649,20 @@ def main(unused_argv):
                     "val_score": val_stats['score'],
                 }
             )
+        # Early stop if perfect validation accuracy reached.
+        try:
+          val_score_float = float(val_stats['score'])
+        except Exception:
+          val_score_float = val_stats['score']
+        if val_score_float >= 1.0 - 1e-12:
+          logging.info('Validation score reached 1.0 for %s at step %d — stopping early.', FLAGS.algorithms[algo_idx], step)
+          stop_early = True
+          break
 
       next_eval += FLAGS.eval_every
+
+      if stop_early:
+        break
 
       # If best total score, update best checkpoint.
       # Also save a best checkpoint on the first step.
