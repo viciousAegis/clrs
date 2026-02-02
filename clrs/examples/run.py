@@ -623,7 +623,6 @@ def main(unused_argv):
       wandb.log({
           "step": step,
           "train/loss": cur_loss,
-          "train/examples_seen": current_train_items[algo_idx],
       })
 
     # Periodically evaluate model
