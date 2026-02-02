@@ -509,6 +509,8 @@ def main(unused_argv):
       "readout": FLAGS.node_readout,
       "ood_val": FLAGS.ood_val,
       "val_size": val_size,
+      "test_only": FLAGS.test_only,
+      "test_lengths": test_lengths[0] if test_lengths else "max_train_length",
     }
     wandb.init(
       entity=FLAGS.wandb_entity,
@@ -659,8 +661,8 @@ def main(unused_argv):
           val_score_float = float(val_stats['score'])
         except Exception:
           val_score_float = val_stats['score']
-        if val_score_float >= 1.0 - 1e-12:
-          logging.info('Validation score reached 1.0 for %s at step %d — stopping early.', FLAGS.algorithms[algo_idx], step)
+        if val_score_float >= 0.99:
+          logging.info('Validation score reached 0.99 for %s at step %d — stopping early.', FLAGS.algorithms[algo_idx], step)
           stop_early = True
           break
 
