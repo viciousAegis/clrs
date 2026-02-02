@@ -20,3 +20,5 @@ venv/
 
 edge_*
 CLRS30
+
+wandb/
