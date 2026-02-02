@@ -620,6 +620,11 @@ def main(unused_argv):
       logging.info('Algo %s step %i current loss %f, current_train_items %i.',
                    FLAGS.algorithms[algo_idx], step,
                    cur_loss, current_train_items[algo_idx])
+      wandb.log({
+          "step": step,
+          "train/loss": cur_loss,
+          "train/examples_seen": current_train_items[algo_idx],
+      })
 
     # Periodically evaluate model
     if step >= next_eval:
@@ -645,8 +650,9 @@ def main(unused_argv):
             avg_loss = accum_loss / FLAGS.eval_every
             wandb.log(
                 {
-                    "loss": avg_loss,
-                    "val_score": val_stats['score'],
+                    "step": step,
+                    "val/loss": avg_loss,
+                    "val/score": val_stats['score'],
                 }
             )
         # Early stop if perfect validation accuracy reached.
@@ -715,8 +721,8 @@ def main(unused_argv):
       return_attention_entropy=FLAGS.return_attention_entropy)
     logging.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
     if FLAGS.wandb_project:
-        wandb.log({"test_score": test_stats['score']})
-        wandb.log({"test_attention_entropy": test_stats.get('attention_entropy', None)})
+        wandb.log({"test/score": test_stats['score']})
+        wandb.log({"test/attention_entropy": test_stats.get('attention_entropy', None)})
 
   logging.info('Done!')
 
