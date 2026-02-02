@@ -160,6 +160,11 @@ class BaselineModel(model.Model):
       hint_repred_mode: str = 'soft',
       name: str = 'base_model',
       nb_msg_passing_steps: int = 1,
+      num_layers: int = 3,
+      activation: str = 'relu',
+      attention_dropout: float = 0.0,
+      norm_first_att: bool = False,
+      node_readout: str = 'diagonal',
       debug: bool = False,
   ):
     """Constructor for BaselineModel.
@@ -248,21 +253,19 @@ class BaselineModel(model.Model):
 
     self._create_net_fns(hidden_dim, encode_hints, processor_factory, use_lstm,
                          encoder_init, dropout_prob, hint_teacher_forcing,
-                         hint_repred_mode)
+                         hint_repred_mode, num_layers, activation, attention_dropout, norm_first_att, node_readout)
     self._device_params = None
     self._device_opt_state = None
     self.opt_state_skeleton = None
 
   def _create_net_fns(self, hidden_dim, encode_hints, processor_factory,
                       use_lstm, encoder_init, dropout_prob,
-                      hint_teacher_forcing, hint_repred_mode):
+                      hint_teacher_forcing, hint_repred_mode, num_layers, activation, attention_dropout, norm_first_att, node_readout):
     def _use_net(*args, **kwargs):
       return nets.Net(self._spec, hidden_dim, encode_hints, self.decode_hints,
                       processor_factory, use_lstm, encoder_init,
-                      dropout_prob, hint_teacher_forcing,
-                      hint_repred_mode,
-                      self.nb_dims, self.nb_msg_passing_steps,
-                      self.debug)(*args, **kwargs)
+                      dropout_prob, hint_teacher_forcing,  num_layers,
+                      attention_dropout, activation, hint_repred_mode, self.nb_dims, self.nb_msg_passing_steps, self.debug, norm_first=norm_first_att, node_readout=node_readout)(*args, **kwargs)
 
     self.net_fn = hk.transform(_use_net)
     pmap_args = dict(axis_name='batch', devices=jax.local_devices())
@@ -274,23 +277,25 @@ class BaselineModel(model.Model):
     self._maybe_pmean = pmean if n_devices > 1 else lambda x: x
     extra_args[static_arg] = 3
     self.jitted_grad = func(self._compute_grad, **extra_args)
-    extra_args[static_arg] = 4
+    # extra_args[static_arg] = 4
+    extra_args[static_arg] = [4, 5]
     self.jitted_feedback = func(self._feedback, donate_argnums=[0, 3],
                                 **extra_args)
-    extra_args[static_arg] = [3, 4, 5]
+    # extra_args[static_arg] = [3, 4, 5]
+    extra_args[static_arg] = [3, 4, 5, 6, 7]
     self.jitted_predict = func(self._predict, **extra_args)
     extra_args[static_arg] = [3, 4]
     self.jitted_accum_opt_update = func(accum_opt_update, donate_argnums=[0, 2],
                                         **extra_args)
 
-  def init(self, features: Union[_Features, List[_Features]], seed: _Seed):
+  def init(self, features: Union[_Features, List[_Features]], is_graph_fts_avail: List, seed: _Seed):
     if not isinstance(features, list):
       assert len(self._spec) == 1
       features = [features]
     self.params = self.net_fn.init(jax.random.PRNGKey(seed), features, True,  # pytype: disable=wrong-arg-types  # jax-ndarray
                                    algorithm_index=-1,
                                    return_hints=False,
-                                   return_all_outputs=False)
+                                   return_all_outputs=False, is_graph_fts_avail=is_graph_fts_avail)
     self.opt_state = self.opt.init(self.params)
     # We will use the optimizer state skeleton for traversal when we
     # want to avoid updating the state of params of untrained algorithms.
@@ -321,9 +326,9 @@ class BaselineModel(model.Model):
         params, rng_key, feedback, algorithm_index)
     return self._maybe_pmean(lss), self._maybe_pmean(grads)
 
-  def _feedback(self, params, rng_key, feedback, opt_state, algorithm_index):
+  def _feedback(self, params, rng_key, feedback, opt_state, algorithm_index, is_graph_fts_avail):
     lss, grads = jax.value_and_grad(self._loss)(
-        params, rng_key, feedback, algorithm_index)
+        params, rng_key, feedback, algorithm_index, is_graph_fts_avail)
     grads = self._maybe_pmean(grads)
     params, opt_state = self._update_params(params, grads, opt_state,
                                             algorithm_index)
@@ -332,16 +337,24 @@ class BaselineModel(model.Model):
 
   def _predict(self, params, rng_key: hk.PRNGSequence, features: _Features,
                algorithm_index: int, return_hints: bool,
-               return_all_outputs: bool):
+               return_all_outputs: bool, is_graph_fts_avail: bool,
+               return_attention_entropy: bool = False):
     net_outputs = self.net_fn.apply(
         params, rng_key, [features],
         repred=True, algorithm_index=algorithm_index,
         return_hints=return_hints,
-        return_all_outputs=return_all_outputs)
+        return_all_outputs=return_all_outputs, is_graph_fts_avail=is_graph_fts_avail,
+        return_attention_entropy=return_attention_entropy)
     if self.debug:
-      outs, hint_preds, hidden_states = net_outputs
+      if return_attention_entropy:
+        outs, hint_preds, hidden_states, attention_entropy = net_outputs
+      else:
+        outs, hint_preds, hidden_states = net_outputs
     else:
-      outs, hint_preds = net_outputs
+      if return_attention_entropy:
+        outs, hint_preds, attention_entropy = net_outputs
+      else:
+        outs, hint_preds = net_outputs
     outs = decoders.postprocess(self._spec[algorithm_index],
                                 outs,
                                 sinkhorn_temperature=0.1,
@@ -349,8 +362,12 @@ class BaselineModel(model.Model):
                                 hard=True,
                                 )
     if self.debug:
+      if return_attention_entropy:
+        return outs, hint_preds, hidden_states, attention_entropy
       return outs, hint_preds, hidden_states
     else:
+      if return_attention_entropy:
+        return outs, hint_preds, attention_entropy
       return outs, hint_preds
 
   def compute_grad(
@@ -376,7 +393,7 @@ class BaselineModel(model.Model):
 
     return  loss, grads
 
-  def feedback(self, rng_key: hk.PRNGSequence, feedback: _Feedback,
+  def feedback(self, rng_key: hk.PRNGSequence, feedback: _Feedback, is_graph_fts_avail: bool,
                algorithm_index=None) -> float:
     if algorithm_index is None:
       assert len(self._spec) == 1
@@ -386,14 +403,16 @@ class BaselineModel(model.Model):
     feedback = _maybe_pmap_data(feedback)
     loss, self._device_params, self._device_opt_state = self.jitted_feedback(
         self._device_params, rng_keys, feedback,
-        self._device_opt_state, algorithm_index)
+        self._device_opt_state, algorithm_index, is_graph_fts_avail)
     loss = _maybe_pick_first_pmapped(loss)
     return loss
 
   def predict(self, rng_key: hk.PRNGSequence, features: _Features,
               algorithm_index: Optional[int] = None,
               return_hints: bool = False,
-              return_all_outputs: bool = False):
+              return_all_outputs: bool = False,
+              is_graph_fts_avail: bool = False,
+              return_attention_entropy: bool = False):
     """Model inference step."""
     if algorithm_index is None:
       assert len(self._spec) == 1
@@ -406,16 +425,19 @@ class BaselineModel(model.Model):
             self._device_params, rng_keys, features,
             algorithm_index,
             return_hints,
-            return_all_outputs))
+            return_all_outputs,
+          is_graph_fts_avail,
+          return_attention_entropy,))
 
-  def _loss(self, params, rng_key, feedback, algorithm_index):
+  def _loss(self, params, rng_key, feedback, algorithm_index, is_graph_fts_avail):
     """Calculates model loss f(feedback; params)."""
     outputs = self.net_fn.apply(
         params, rng_key, [feedback.features],
         repred=False,
         algorithm_index=algorithm_index,
         return_hints=True,
-        return_all_outputs=False)
+        return_all_outputs=False,
+        is_graph_fts_avail=is_graph_fts_avail)
     if self.debug:
       output_preds, hint_preds, _ = outputs
     else:
@@ -494,10 +516,17 @@ class BaselineModel(model.Model):
     with open(path, 'rb') as f:
       restored_state = pickle.load(f)
       if only_load_processor:
+        if self.params is None:
+          raise ValueError(
+              'Cannot restore processor-only weights before model init. '
+              'Initialize the model or set only_load_processor=False.')
         restored_params = _filter_in_processor(restored_state['params'])
       else:
         restored_params = restored_state['params']
-      self.params = hk.data_structures.merge(self.params, restored_params)
+      if self.params is None:
+        self.params = restored_params
+      else:
+        self.params = hk.data_structures.merge(self.params, restored_params)
       self.opt_state = restored_state['opt_state']
 
   def save_model(self, file_name: str):

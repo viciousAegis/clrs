@@ -29,4 +29,5 @@ __all__ = (
     "MPNN",
     "Net",
     "NetChunked",
+    "ET_Processor",
 )

@@ -17,3 +17,6 @@ venv/
 # Editors
 .idea
 .vscode
+
+edge_*
+CLRS30

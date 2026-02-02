@@ -29,11 +29,14 @@ import numpy as np
 import requests
 import tensorflow as tf
 
+import wandb
 
-flags.DEFINE_list('algorithms', ['bfs'], 'Which algorithms to run.')
-flags.DEFINE_list('train_lengths', ['4', '7', '11', '13', '16'],
-                  'Which training sizes to use. A size of -1 means '
+flags.DEFINE_list('algorithms', ['dijkstra'], 'Which algorithms to run.')
+flags.DEFINE_list('train_lengths', ['8'], 'Which training sizes to use. A size of -1 means '
                   'use the benchmark dataset.')
+flags.DEFINE_list('test_lengths', [],
+                  'Which test sizes to use. If empty, defaults to max train length. '
+                  'A size of -1 means use the benchmark dataset.')
 flags.DEFINE_integer('length_needle', -8,
                      'Length of needle for training and validation '
                      '(not testing) in string matching algorithms. '
@@ -43,13 +46,17 @@ flags.DEFINE_integer('length_needle', -8,
                      'the haystack (the default sampler behavior).')
 flags.DEFINE_integer('seed', 42, 'Random seed to set')
 
+flags.DEFINE_boolean('test_only', False, "Whether to only run evaluation on test set.")
+flags.DEFINE_boolean('return_attention_entropy', False,
+                     'Whether to compute attention entropy during evaluation.')
+
 flags.DEFINE_boolean('random_pos', True,
                      'Randomize the pos input common to all algos.')
 flags.DEFINE_boolean('enforce_permutations', True,
                      'Whether to enforce permutation-type node pointers.')
 flags.DEFINE_boolean('enforce_pred_as_input', True,
                      'Whether to change pred_h hints into pred inputs.')
-flags.DEFINE_integer('batch_size', 32, 'Batch size used for training.')
+flags.DEFINE_integer('batch_size', 4, 'Batch size used for training.')
 flags.DEFINE_boolean('chunked_training', False,
                      'Whether to use chunking for training.')
 flags.DEFINE_integer('chunk_length', 16,
@@ -59,12 +66,14 @@ flags.DEFINE_integer('train_steps', 10000, 'Number of training iterations.')
 flags.DEFINE_integer('eval_every', 50, 'Evaluation frequency (in steps).')
 flags.DEFINE_integer('test_every', 500, 'Evaluation frequency (in steps).')
 
-flags.DEFINE_integer('hidden_size', 128,
+flags.DEFINE_integer('hidden_size', 192,
                      'Number of hidden units of the model.')
+flags.DEFINE_integer('num_layers', 1,
+                     'Number of layers of the network.')
 flags.DEFINE_integer('nb_heads', 1, 'Number of heads for GAT processors')
 flags.DEFINE_integer('nb_msg_passing_steps', 1,
                      'Number of message passing steps to run per hint.')
-flags.DEFINE_float('learning_rate', 0.001, 'Learning rate to use.')
+flags.DEFINE_float('learning_rate', 2.5e-4, 'Learning rate to use.')
 flags.DEFINE_float('grad_clip_max_norm', 1.0,
                    'Gradient clipping by norm. 0.0 disables grad clipping')
 flags.DEFINE_float('dropout_prob', 0.0, 'Dropout rate to use.')
@@ -72,6 +81,12 @@ flags.DEFINE_float('hint_teacher_forcing', 0.0,
                    'Probability that ground-truth teacher hints are encoded '
                    'during training instead of predicted hints. Only '
                    'pertinent in encoded_decoded modes.')
+flags.DEFINE_float('attention_dropout_prob', 0.0, 'Dropout rate in the attention heads to use.')
+flags.DEFINE_enum('activation', 'relu', ['relu', 'gelu'], 'Type of activation function to use.')
+flags.DEFINE_integer('use_graph_fts', 1,
+                     'Whether to use the graph features.')
+flags.DEFINE_integer('ood_val', 0,
+                     'Whether to apply bigger graphs for the val. samples.')
 flags.DEFINE_enum('hint_mode', 'encoded_decoded',
                   ['encoded_decoded', 'decoded_only', 'none'],
                   'How should hints be used? Note, each mode defines a '
@@ -94,6 +109,8 @@ flags.DEFINE_enum('hint_repred_mode', 'soft', ['soft', 'hard', 'hard_on_eval'],
                   'thresholding of masks. '
                   'In hard_on_eval mode, soft mode is '
                   'used for training and hard mode is used for evaluation.')
+flags.DEFINE_boolean('norm_first_att', True,
+                     'Whether to normalize the input to the attention layers.')
 flags.DEFINE_boolean('use_ln', True,
                      'Whether to use layer normalisation in the processor.')
 flags.DEFINE_boolean('use_lstm', False,
@@ -104,20 +121,30 @@ flags.DEFINE_integer('nb_triplet_fts', 8,
 flags.DEFINE_enum('encoder_init', 'xavier_on_scalars',
                   ['default', 'xavier_on_scalars'],
                   'Initialiser to use for the encoders.')
-flags.DEFINE_enum('processor_type', 'triplet_gmpnn',
+flags.DEFINE_enum('processor_type', 'edge_t',
                   ['deepsets', 'mpnn', 'pgn', 'pgn_mask',
                    'triplet_mpnn', 'triplet_pgn', 'triplet_pgn_mask',
                    'gat', 'gatv2', 'gat_full', 'gatv2_full',
                    'gpgn', 'gpgn_mask', 'gmpnn',
-                   'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn'],
+                   'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn', 'edge_t'],
                   'Processor type to use as the network P.')
+flags.DEFINE_enum('node_readout', 'diagonal',
+                  ['diagonal', 'sophisticated'],
+                  'Method to extract the node features from transformer output.')
 
-flags.DEFINE_string('checkpoint_path', '/tmp/CLRS30',
+flags.DEFINE_string('checkpoint_path', './CLRS30',
                     'Path in which checkpoints are saved.')
-flags.DEFINE_string('dataset_path', '/tmp/CLRS30',
+flags.DEFINE_string('dataset_path', './CLRS30',
                     'Path in which dataset is stored.')
 flags.DEFINE_boolean('freeze_processor', False,
                      'Whether to freeze the processor of the model.')
+
+flags.DEFINE_string('wandb_entity', None,
+                    'Name of `wandb` entity.')
+flags.DEFINE_string('wandb_project', None,
+                    'Name of `wandb` project.')
+flags.DEFINE_string('wandb_name', None,
+                    'Name of `wandb` run.')
 
 FLAGS = flags.FLAGS
 
@@ -250,22 +277,31 @@ def _concat(dps, axis):
   return jax.tree_util.tree_map(lambda *x: np.concatenate(x, axis), *dps)
 
 
-def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras):
+def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
+                     return_attention_entropy: bool = False):
   """Collect batches of output and hint preds and evaluate them."""
   processed_samples = 0
   preds = []
   outputs = []
+  attention_entropies = []
   while processed_samples < sample_count:
     feedback = next(sampler)
     batch_size = feedback.outputs[0].data.shape[0]
     outputs.append(feedback.outputs)
     new_rng_key, rng_key = jax.random.split(rng_key)
-    cur_preds, _ = predict_fn(new_rng_key, feedback.features)
+    pred_out = predict_fn(new_rng_key, feedback.features)
+    if return_attention_entropy and len(pred_out) == 3:
+      cur_preds, _, attention_entropy = pred_out
+      attention_entropies.append(np.asarray(attention_entropy))
+    else:
+      cur_preds, _ = pred_out
     preds.append(cur_preds)
     processed_samples += batch_size
   outputs = _concat(outputs, axis=0)
   preds = _concat(preds, axis=0)
   out = clrs.evaluate(outputs, preds)
+  if return_attention_entropy and attention_entropies:
+    out['attention_entropy'] = float(np.nanmean(attention_entropies))
   if extras:
     out.update(extras)
   return {k: unpack(v) for k, v in out.items()}
@@ -314,6 +350,7 @@ def create_samplers(
   test_samplers = []
   test_sample_counts = []
   spec_list = []
+  is_graph_fts_avail = []
 
   algorithms = algorithms or FLAGS.algorithms
   for algo_idx, algorithm in enumerate(algorithms):
@@ -370,6 +407,12 @@ def create_samplers(
       train_sampler, _, _ = make_multi_sampler(**train_args)
 
       mult = clrs.CLRS_30_ALGS_SETTINGS[algorithm]['num_samples_multiplier']
+      
+      if FLAGS.ood_val:
+          val_lengths = [32]
+      else:
+          val_lengths = [np.amax(train_lengths)]
+      
       val_args = dict(
           sizes=val_lengths or [np.amax(current_algo_train_lengths)],
           split='val',
@@ -398,11 +441,14 @@ def create_samplers(
     val_sample_counts.append(val_samples)
     test_samplers.append(test_sampler)
     test_sample_counts.append(test_samples)
+    input_spec = list(filter(lambda x: x[0] in ['input', 'hint'], spec.values()))
+    graph_fts_exists = any('graph' in value for value in input_spec) 
+    is_graph_fts_avail.append(graph_fts_exists)
 
   return (train_samplers,
           val_samplers, val_sample_counts,
           test_samplers, test_sample_counts,
-          spec_list)
+          spec_list, is_graph_fts_avail)
 
 
 def main(unused_argv):
@@ -419,6 +465,7 @@ def main(unused_argv):
     raise ValueError('Hint mode not in {encoded_decoded, decoded_only, none}.')
 
   train_lengths = [int(x) for x in FLAGS.train_lengths]
+  test_lengths = [int(x) for x in FLAGS.test_lengths] if FLAGS.test_lengths else None
 
   rng = np.random.RandomState(FLAGS.seed)
   rng_key = jax.random.PRNGKey(rng.randint(2**32))
@@ -431,14 +478,44 @@ def main(unused_argv):
       test_samplers,
       test_sample_counts,
       spec_list,
-  ) = create_samplers(
+      is_graph_fts_avail,
+    ) = create_samplers(
       rng=rng,
       train_lengths=train_lengths,
       algorithms=FLAGS.algorithms,
       val_lengths=[np.amax(train_lengths)],
-      test_lengths=[-1],
+      test_lengths=test_lengths or [np.amax(train_lengths)],
       train_batch_size=FLAGS.batch_size,
   )
+  
+  if FLAGS.wandb_project:
+    if FLAGS.ood_val:
+        val_size = [32]
+    else:
+        val_size = [np.amax(train_lengths)]
+    config = {
+      "processor": FLAGS.processor_type,
+      "algorithm": FLAGS.algorithms[0],
+      "activation": FLAGS.activation,
+      "step_nums": FLAGS.train_steps,
+      "lr": FLAGS.learning_rate,
+      "batch_size": FLAGS.batch_size,
+      "nb_heads": FLAGS.nb_heads,
+      "num_layers": FLAGS.num_layers,
+      "hidden_size": FLAGS.hidden_size,
+      "attention_dropout_rate": FLAGS.attention_dropout_prob,
+      "norm_first_att": FLAGS.norm_first_att,
+      "seed_param": FLAGS.seed,
+      "readout": FLAGS.node_readout,
+      "ood_val": FLAGS.ood_val,
+      "val_size": val_size,
+    }
+    wandb.init(
+      entity=FLAGS.wandb_entity,
+      project=FLAGS.wandb_project,
+      name=FLAGS.wandb_name,
+      config={"dataset": "clrs30", **dict(config)},
+    )
 
   processor_factory = clrs.get_processor_factory(
       FLAGS.processor_type,
@@ -461,7 +538,14 @@ def main(unused_argv):
       hint_teacher_forcing=FLAGS.hint_teacher_forcing,
       hint_repred_mode=FLAGS.hint_repred_mode,
       nb_msg_passing_steps=FLAGS.nb_msg_passing_steps,
-      )
+      num_layers=FLAGS.num_layers,
+      activation=FLAGS.activation,
+      attention_dropout=FLAGS.attention_dropout_prob,
+      norm_first_att=FLAGS.norm_first_att,
+      node_readout=FLAGS.node_readout,
+  )
+  if not FLAGS.use_graph_fts:
+      is_graph_fts_avail = [False] * len(is_graph_fts_avail)
 
   eval_model = clrs.models.BaselineModel(
       spec=spec_list,
@@ -486,7 +570,10 @@ def main(unused_argv):
   # until all algos have had at least one evaluation.
   val_scores = [-99999.9] * len(FLAGS.algorithms)
   length_idx = 0
+  accum_loss = 0
 
+  for algo_idx in range(len(train_samplers)):
+    logging.info(f"{FLAGS.algorithms[algo_idx]} has graph features: {is_graph_fts_avail[algo_idx]}")
   while step < FLAGS.train_steps:
     feedback_list = [next(t) for t in train_samplers]
 
@@ -502,7 +589,11 @@ def main(unused_argv):
             for _ in range(len(train_lengths))]
         train_model.init(all_length_features[:-1], FLAGS.seed + 1)
       else:
-        train_model.init(all_features, FLAGS.seed + 1)
+        # train_model.init(all_features, FLAGS.seed + 1)
+        train_model.init(all_features, is_graph_fts_avail, FLAGS.seed + 1)
+        
+    if FLAGS.test_only:
+      break
 
     # Training step.
     for algo_idx in range(len(train_samplers)):
@@ -516,7 +607,8 @@ def main(unused_argv):
         # In non-chunked training, all training lengths can be treated equally,
         # since there is no state to maintain between batches.
         length_and_algo_idx = algo_idx
-      cur_loss = train_model.feedback(rng_key, feedback, length_and_algo_idx)
+      cur_loss = train_model.feedback(rng_key, feedback, is_graph_fts_avail[algo_idx], length_and_algo_idx)
+      accum_loss += cur_loss
       rng_key = new_rng_key
 
       if FLAGS.chunked_training:
@@ -540,13 +632,22 @@ def main(unused_argv):
         new_rng_key, rng_key = jax.random.split(rng_key)
         val_stats = collect_and_eval(
             val_samplers[algo_idx],
-            functools.partial(eval_model.predict, algorithm_index=algo_idx),
+            functools.partial(eval_model.predict, algorithm_index=algo_idx, is_graph_fts_avail=is_graph_fts_avail[algo_idx]),
             val_sample_counts[algo_idx],
             new_rng_key,
             extras=common_extras)
         logging.info('(val) algo %s step %d: %s',
                      FLAGS.algorithms[algo_idx], step, val_stats)
         val_scores[algo_idx] = val_stats['score']
+        if FLAGS.wandb_project:
+          if step > 0:
+            avg_loss = accum_loss / FLAGS.eval_every
+            wandb.log(
+                {
+                    "loss": avg_loss,
+                    "val_score": val_stats['score'],
+                }
+            )
 
       next_eval += FLAGS.eval_every
 
@@ -561,29 +662,48 @@ def main(unused_argv):
       if (sum(val_scores) > best_score) or step == 0:
         best_score = sum(val_scores)
         logging.info('Checkpointing best model, %s', msg)
-        train_model.save_model('best.pkl')
+        # Save a per-algorithm checkpoint file named "<algorithm>-best.pkl".
+        for algo in FLAGS.algorithms:
+          train_model.save_model(f"{algo}-best.pkl")
       else:
         logging.info('Not saving new best model, %s', msg)
+        
+      accum_loss = 0
+      avg_loss = 0
 
     step += 1
     length_idx = (length_idx + 1) % len(train_lengths)
 
-  logging.info('Restoring best model from checkpoint...')
-  eval_model.restore_model('best.pkl', only_load_processor=False)
+  logging.info(f'Restoring best model files from checkpoint {FLAGS.checkpoint_path}...')
 
+  logging.info('Evaluating best model on test sets...')
   for algo_idx in range(len(train_samplers)):
     common_extras = {'examples_seen': current_train_items[algo_idx],
                      'step': step,
                      'algorithm': FLAGS.algorithms[algo_idx]}
 
+    # Restore the best checkpoint specific to this algorithm.
+    algo_name = FLAGS.algorithms[algo_idx]
+    ckpt_file = f"{algo_name}-best.pkl"
+    logging.info('Restoring checkpoint %s for algorithm %s...', ckpt_file, algo_name)
+    eval_model.restore_model(ckpt_file, only_load_processor=False)
+
     new_rng_key, rng_key = jax.random.split(rng_key)
     test_stats = collect_and_eval(
         test_samplers[algo_idx],
-        functools.partial(eval_model.predict, algorithm_index=algo_idx),
+      functools.partial(
+        eval_model.predict,
+        algorithm_index=algo_idx,
+        is_graph_fts_avail=is_graph_fts_avail[algo_idx],
+        return_attention_entropy=FLAGS.return_attention_entropy),
         test_sample_counts[algo_idx],
         new_rng_key,
-        extras=common_extras)
+      extras=common_extras,
+      return_attention_entropy=FLAGS.return_attention_entropy)
     logging.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
+    if FLAGS.wandb_project:
+        wandb.log({"test_score": test_stats['score']})
+        wandb.log({"test_attention_entropy": test_stats.get('attention_entropy', None)})
 
   logging.info('Done!')
 

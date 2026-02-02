@@ -50,6 +50,7 @@ class _MessagePassingScanState:
   output_preds: chex.Array
   hiddens: chex.Array
   lstm_state: Optional[hk.LSTMState]
+  attention_entropy: chex.Array
 
 
 @chex.dataclass
@@ -82,11 +83,16 @@ class Net(hk.Module):
       encoder_init: str,
       dropout_prob: float,
       hint_teacher_forcing: float,
+      num_layers: int,
+      attention_dropout: float,
+      activation: str,
       hint_repred_mode='soft',
       nb_dims=None,
       nb_msg_passing_steps=1,
       debug=False,
       name: str = 'net',
+      norm_first: bool = False,
+      node_readout: str = 'diagonal',
   ):
     """Constructs a `Net`."""
     super().__init__(name=name)
@@ -104,6 +110,11 @@ class Net(hk.Module):
     self.encoder_init = encoder_init
     self.nb_msg_passing_steps = nb_msg_passing_steps
     self.debug = debug
+    self.num_layers = num_layers
+    self.attention_dropout = attention_dropout
+    self.activation = activation
+    self.norm_first = norm_first
+    self.node_readout = node_readout
 
   def _msg_passing_step(self,
                         mp_state: _MessagePassingScanState,
@@ -119,7 +130,9 @@ class Net(hk.Module):
                         encs: Dict[str, List[hk.Module]],
                         decs: Dict[str, Tuple[hk.Module]],
                         return_hints: bool,
-                        return_all_outputs: bool
+                        return_all_outputs: bool,
+                        is_graph_fts_avail: bool,
+                        return_attention_entropy: bool,
                         ):
     if self.decode_hints and not first_step:
       assert self._hint_repred_mode in ['soft', 'hard', 'hard_on_eval']
@@ -164,10 +177,12 @@ class Net(hk.Module):
             probing.DataPoint(
                 name=hint.name, location=loc, type_=typ, data=hint_data))
 
-    hiddens, output_preds_cand, hint_preds, lstm_state = self._one_step_pred(
-        inputs, cur_hint, mp_state.hiddens,
-        batch_size, nb_nodes, mp_state.lstm_state,
-        spec, encs, decs, repred)
+    hiddens, output_preds_cand, hint_preds, lstm_state, attention_entropy = (
+        self._one_step_pred(
+            inputs, cur_hint, mp_state.hiddens,
+            batch_size, nb_nodes, mp_state.lstm_state,
+            spec, encs, decs, repred, is_graph_fts_avail,
+            return_attention_entropy=return_attention_entropy))
 
     if first_step:
       output_preds = output_preds_cand
@@ -183,12 +198,17 @@ class Net(hk.Module):
         hint_preds=hint_preds,
         output_preds=output_preds,
         hiddens=hiddens,
-        lstm_state=lstm_state)
+        lstm_state=lstm_state,
+      attention_entropy=jnp.asarray(attention_entropy))
     # Save memory by not stacking unnecessary fields
     accum_mp_state = _MessagePassingScanState(  # pytype: disable=wrong-arg-types  # numpy-scalars
         hint_preds=hint_preds if return_hints else None,
         output_preds=output_preds if return_all_outputs else None,
-        hiddens=hiddens if self.debug else None, lstm_state=None)
+        hiddens=hiddens if self.debug else None,
+        lstm_state=None,
+      attention_entropy=(jnp.asarray(attention_entropy)
+                 if return_attention_entropy
+                 else jnp.asarray(jnp.nan)))
 
     # Complying to jax.scan, the first returned value is the state we carry over
     # the second value is the output that will be stacked over steps.
@@ -197,7 +217,9 @@ class Net(hk.Module):
   def __call__(self, features_list: List[_Features], repred: bool,
                algorithm_index: int,
                return_hints: bool,
-               return_all_outputs: bool):
+               return_all_outputs: bool,
+               is_graph_fts_avail: bool,
+               return_attention_entropy: bool = False):
     """Process one batch of data.
 
     Args:
@@ -230,10 +252,17 @@ class Net(hk.Module):
       algorithm_indices = range(len(features_list))
     else:
       algorithm_indices = [algorithm_index]
+      is_graph_fts_avail = [is_graph_fts_avail]
     assert len(algorithm_indices) == len(features_list)
 
     self.encoders, self.decoders = self._construct_encoders_decoders()
-    self.processor = self.processor_factory(self.hidden_dim)
+    self.processor = self.processor_factory(
+        self.hidden_dim,
+        num_layers=self.num_layers,
+        attention_dropout=self.attention_dropout,
+        activation=self.activation,
+        norm_first = self.norm_first,
+    )
 
     # Optionally construct LSTM.
     if self.use_lstm:
@@ -245,7 +274,7 @@ class Net(hk.Module):
       self.lstm = None
       lstm_init = lambda x: 0
 
-    for algorithm_index, features in zip(algorithm_indices, features_list):
+    for algorithm_index, features, graph_fts_avail in zip(algorithm_indices, features_list, is_graph_fts_avail):
       inputs = features.inputs
       hints = features.hints
       lengths = features.lengths
@@ -265,7 +294,8 @@ class Net(hk.Module):
 
       mp_state = _MessagePassingScanState(  # pytype: disable=wrong-arg-types  # numpy-scalars
           hint_preds=None, output_preds=None,
-          hiddens=hiddens, lstm_state=lstm_state)
+          hiddens=hiddens, lstm_state=lstm_state,
+          attention_entropy=jnp.nan)
 
       # Do the first step outside of the scan because it has a different
       # computation graph.
@@ -281,6 +311,8 @@ class Net(hk.Module):
           decs=self.decoders[algorithm_index],
           return_hints=return_hints,
           return_all_outputs=return_all_outputs,
+          is_graph_fts_avail=graph_fts_avail,
+            return_attention_entropy=return_attention_entropy,
           )
       mp_state, lean_mp_state = self._msg_passing_step(
           mp_state,
@@ -320,9 +352,18 @@ class Net(hk.Module):
       output_preds = output_mp_state.output_preds
     hint_preds = invert(accum_mp_state.hint_preds)
 
+    attention_entropy = None
+    if return_attention_entropy:
+      attention_entropy = jnp.mean(accum_mp_state.attention_entropy)
+
     if self.debug:
       hiddens = jnp.stack([v for v in accum_mp_state.hiddens])
+      if return_attention_entropy:
+        return output_preds, hint_preds, hiddens, attention_entropy
       return output_preds, hint_preds, hiddens
+
+    if return_attention_entropy:
+      return output_preds, hint_preds, attention_entropy
 
     return output_preds, hint_preds
 
@@ -373,6 +414,8 @@ class Net(hk.Module):
       encs: Dict[str, List[hk.Module]],
       decs: Dict[str, Tuple[hk.Module]],
       repred: bool,
+      is_graph_fts: bool,
+      return_attention_entropy: bool = False,
   ):
     """Generates one-step predictions."""
 
@@ -404,8 +447,9 @@ class Net(hk.Module):
 
     # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     nxt_hidden = hidden
+    attention_entropy = jnp.asarray(jnp.nan)
     for _ in range(self.nb_msg_passing_steps):
-      nxt_hidden, nxt_edge = self.processor(
+      processor_out = self.processor(
           node_fts,
           edge_fts,
           graph_fts,
@@ -413,7 +457,20 @@ class Net(hk.Module):
           nxt_hidden,
           batch_size=batch_size,
           nb_nodes=nb_nodes,
+          repred=repred,
+          readout=self.node_readout,
+          is_graph_fts_avail=is_graph_fts,
+          return_attention=return_attention_entropy,
       )
+      if return_attention_entropy:
+        if isinstance(processor_out, tuple) and len(processor_out) == 3:
+          nxt_hidden, nxt_edge, attentions = processor_out
+        else:
+          nxt_hidden, nxt_edge = processor_out
+          attentions = None
+        attention_entropy = _attention_entropy(attentions)
+      else:
+        nxt_hidden, nxt_edge = processor_out
 
     if not repred:      # dropout only on training
       nxt_hidden = hk.dropout(hk.next_rng_key(), self._dropout_prob, nxt_hidden)
@@ -445,7 +502,26 @@ class Net(hk.Module):
         repred=repred,
     )
 
-    return nxt_hidden, output_preds, hint_preds, nxt_lstm_state
+    return nxt_hidden, output_preds, hint_preds, nxt_lstm_state, attention_entropy
+
+
+def _attention_entropy(attentions: Optional[List[chex.Array]]) -> chex.Array:
+  """Compute mean attention entropy across layers.
+
+  Returns NaN if attention weights are unavailable.
+  """
+  if attentions is None:
+    return jnp.asarray(jnp.nan)
+  entropies = []
+  for att in attentions:
+    if att.ndim != 5:
+      return jnp.asarray(jnp.nan)
+    att = jnp.clip(att, 1e-12, 1.0)
+    entropy = -jnp.sum(att * jnp.log(att), axis=2)
+    entropies.append(jnp.mean(entropy))
+  if not entropies:
+    return jnp.asarray(jnp.nan)
+  return jnp.mean(jnp.stack(entropies))
 
 
 class NetChunked(Net):
