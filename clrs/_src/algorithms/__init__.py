@@ -36,6 +36,7 @@ from clrs._src.algorithms.graphs import bridges
 from clrs._src.algorithms.graphs import strongly_connected_components
 from clrs._src.algorithms.graphs import mst_kruskal
 from clrs._src.algorithms.graphs import mst_prim
+from clrs._src.algorithms.graphs import minimum_edge
 from clrs._src.algorithms.graphs import bellman_ford
 from clrs._src.algorithms.graphs import dijkstra
 from clrs._src.algorithms.graphs import dag_shortest_paths

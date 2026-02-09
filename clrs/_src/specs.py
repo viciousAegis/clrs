@@ -87,6 +87,7 @@ CLRS_30_ALGS = [
     'minimum',
     'mst_kruskal',
     'mst_prim',
+    'minimum_edge',
     'naive_string_matcher',
     'optimal_bst',
     'quickselect',
@@ -393,6 +394,15 @@ SPECS = types.MappingProxyType({
         'mark': (Stage.HINT, Location.NODE, Type.MASK),
         'in_queue': (Stage.HINT, Location.NODE, Type.MASK),
         'u': (Stage.HINT, Location.NODE, Type.MASK_ONE),
+    },
+    'minimum_edge': {
+        'pos': (Stage.INPUT, Location.NODE, Type.SCALAR),
+        'A': (Stage.INPUT, Location.EDGE, Type.SCALAR),
+        'adj': (Stage.INPUT, Location.EDGE, Type.MASK),
+        'min_edge': (Stage.OUTPUT, Location.EDGE, Type.MASK),
+        'min_h': (Stage.HINT, Location.EDGE, Type.MASK),
+        'u': (Stage.HINT, Location.NODE, Type.MASK_ONE),
+        'v': (Stage.HINT, Location.NODE, Type.MASK_ONE),
     },
     'bellman_ford': {
         'pos': (Stage.INPUT, Location.NODE, Type.SCALAR),

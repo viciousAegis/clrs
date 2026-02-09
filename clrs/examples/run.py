@@ -28,6 +28,7 @@ import jax
 import numpy as np
 import requests
 import tensorflow as tf
+from tqdm import tqdm
 
 import wandb
 
@@ -82,6 +83,8 @@ flags.DEFINE_float('hint_teacher_forcing', 0.0,
                    'during training instead of predicted hints. Only '
                    'pertinent in encoded_decoded modes.')
 flags.DEFINE_float('attention_dropout_prob', 0.0, 'Dropout rate in the attention heads to use.')
+flags.DEFINE_float('attention_logit_scale', 1.0,
+                   'Scale factor applied to attention logits (edge_t_scaled only).')
 flags.DEFINE_enum('activation', 'relu', ['relu', 'gelu'], 'Type of activation function to use.')
 flags.DEFINE_integer('use_graph_fts', 1,
                      'Whether to use the graph features.')
@@ -126,7 +129,8 @@ flags.DEFINE_enum('processor_type', 'edge_t',
                    'triplet_mpnn', 'triplet_pgn', 'triplet_pgn_mask',
                    'gat', 'gatv2', 'gat_full', 'gatv2_full',
                    'gpgn', 'gpgn_mask', 'gmpnn',
-                   'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn', 'edge_t'],
+                   'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn',
+                   'edge_t', 'edge_t_scaled', 'graph_t'],
                   'Processor type to use as the network P.')
 flags.DEFINE_enum('node_readout', 'diagonal',
                   ['diagonal', 'sophisticated'],
@@ -277,31 +281,86 @@ def _concat(dps, axis):
   return jax.tree_util.tree_map(lambda *x: np.concatenate(x, axis), *dps)
 
 
+def _tree_to_numpy(tree):
+  return jax.tree_util.tree_map(lambda x: np.asarray(x), tree)
+
+
+def _tree_mean(trees):
+  stacked = jax.tree_util.tree_map(lambda *xs: np.stack(xs, axis=0), *trees)
+  return jax.tree_util.tree_map(lambda x: np.nanmean(x, axis=0), stacked)
+
+
+def _log_attention_heatmap(prefix: str, metric_name: str, values: np.ndarray):
+  if values is None or not isinstance(values, np.ndarray) or values.ndim != 2:
+    return
+  num_layers, num_heads = values.shape
+  rows = []
+  for layer in range(num_layers):
+    for head in range(num_heads):
+      rows.append([int(layer), int(head), float(values[layer, head])])
+  table = wandb.Table(data=rows, columns=["layer", "head", "value"])
+  if hasattr(wandb, "plot") and hasattr(wandb.plot, "heatmap"):
+    plot = wandb.plot.heatmap(
+        table,
+        "head",
+        "layer",
+        "value",
+        title=f"{prefix}/{metric_name}",
+    )
+    wandb.log({f"{prefix}/{metric_name}_heatmap": plot})
+  else:
+    wandb.log({f"{prefix}/{metric_name}_table": table})
+    wandb.log({f"{prefix}/{metric_name}_image": wandb.Image(values)})
+
+
 def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
                      return_attention_entropy: bool = False):
   """Collect batches of output and hint preds and evaluate them."""
   processed_samples = 0
   preds = []
   outputs = []
-  attention_entropies = []
-  while processed_samples < sample_count:
-    feedback = next(sampler)
-    batch_size = feedback.outputs[0].data.shape[0]
-    outputs.append(feedback.outputs)
-    new_rng_key, rng_key = jax.random.split(rng_key)
-    pred_out = predict_fn(new_rng_key, feedback.features)
-    if return_attention_entropy and len(pred_out) == 3:
-      cur_preds, _, attention_entropy = pred_out
-      attention_entropies.append(np.asarray(attention_entropy))
-    else:
-      cur_preds, _ = pred_out
-    preds.append(cur_preds)
-    processed_samples += batch_size
+  attention_stats_list = []
+  pbar = None
+  if sample_count is not None and sample_count > 0:
+    pbar = tqdm(total=sample_count)
+  try:
+    while processed_samples < sample_count:
+      feedback = next(sampler)
+      batch_size = feedback.outputs[0].data.shape[0]
+      outputs.append(feedback.outputs)
+      new_rng_key, rng_key = jax.random.split(rng_key)
+      pred_out = predict_fn(new_rng_key, feedback.features)
+      if return_attention_entropy and len(pred_out) in (3, 4):
+        if len(pred_out) == 3:
+          cur_preds, _, attention_stats = pred_out
+        else:
+          cur_preds, _, _, attention_stats = pred_out
+        if attention_stats is not None:
+          attention_stats_list.append(_tree_to_numpy(attention_stats))
+      else:
+        cur_preds, _ = pred_out
+      preds.append(cur_preds)
+      processed_samples += batch_size
+      if pbar is not None:
+        pbar.update(batch_size)
+  finally:
+    if pbar is not None:
+      pbar.close()
   outputs = _concat(outputs, axis=0)
   preds = _concat(preds, axis=0)
   out = clrs.evaluate(outputs, preds)
-  if return_attention_entropy and attention_entropies:
-    out['attention_entropy'] = float(np.nanmean(attention_entropies))
+  if return_attention_entropy and attention_stats_list:
+    attention_stats = _tree_mean(attention_stats_list)
+    out['attention_entropy'] = float(attention_stats['entropy_mean'])
+    out['attention_entropy_per_layer_head'] = attention_stats['entropy_per_layer_head']
+    out['attention_neff'] = float(attention_stats['neff_mean'])
+    out['attention_neff_per_layer_head'] = attention_stats['neff_per_layer_head']
+    out['attention_top1_mass'] = float(attention_stats['top1_mass_mean'])
+    out['attention_top1_mass_per_layer_head'] = attention_stats['top1_mass_per_layer_head']
+    out['attention_top2_mass'] = float(attention_stats['top2_mass_mean'])
+    out['attention_top2_mass_per_layer_head'] = attention_stats['top2_mass_per_layer_head']
+    out['attention_top4_mass'] = float(attention_stats['top4_mass_mean'])
+    out['attention_top4_mass_per_layer_head'] = attention_stats['top4_mass_per_layer_head']
   if extras:
     out.update(extras)
   return {k: unpack(v) for k, v in out.items()}
@@ -524,6 +583,7 @@ def main(unused_argv):
       use_ln=FLAGS.use_ln,
       nb_triplet_fts=FLAGS.nb_triplet_fts,
       nb_heads=FLAGS.nb_heads,
+      attention_logit_scale=FLAGS.attention_logit_scale,
   )
   model_params = dict(
       processor_factory=processor_factory,
@@ -661,8 +721,8 @@ def main(unused_argv):
           val_score_float = float(val_stats['score'])
         except Exception:
           val_score_float = val_stats['score']
-        if val_score_float >= 0.99:
-          logging.info('Validation score reached 0.99 for %s at step %d — stopping early.', FLAGS.algorithms[algo_idx], step)
+        if val_score_float >= 1.00:
+          logging.info('Validation score reached 1.00 for %s at step %d — stopping early.', FLAGS.algorithms[algo_idx], step)
           stop_early = True
           break
 
@@ -724,6 +784,30 @@ def main(unused_argv):
     if FLAGS.wandb_project:
         wandb.log({"test/score": test_stats['score']})
         wandb.log({"test/attention_entropy": test_stats.get('attention_entropy', None)})
+        wandb.log({"test/attention_neff": test_stats.get('attention_neff', None)})
+        wandb.log({"test/attention_top1_mass": test_stats.get('attention_top1_mass', None)})
+        wandb.log({"test/attention_top2_mass": test_stats.get('attention_top2_mass', None)})
+        wandb.log({"test/attention_top4_mass": test_stats.get('attention_top4_mass', None)})
+        _log_attention_heatmap(
+            "test",
+            "attention_entropy",
+            test_stats.get('attention_entropy_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_neff",
+            test_stats.get('attention_neff_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_top1_mass",
+            test_stats.get('attention_top1_mass_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_top2_mass",
+            test_stats.get('attention_top2_mass_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_top4_mass",
+            test_stats.get('attention_top4_mass_per_layer_head', None))
 
   logging.info('Done!')
 

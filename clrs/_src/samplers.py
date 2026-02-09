@@ -548,6 +548,30 @@ class MSTSampler(Sampler):
     return [graph]
 
 
+class MinimumEdgeSampler(Sampler):
+  """Sampler for minimum edge selection."""
+  CAN_TRUNCATE_INPUT_DATA = True
+
+  def _sample_data(
+      self,
+      length: int,
+      p: Tuple[float, ...] = (0.2,),
+      low: float = 0.,
+      high: float = 1.,
+  ):
+    while True:
+      graph = self._random_er_graph(
+          nb_nodes=length,
+          p=self._rng.choice(p),
+          directed=False,
+          acyclic=False,
+          weighted=True,
+          low=low,
+          high=high)
+      if np.any(graph != 0):
+        return [graph]
+
+
 class BellmanFordSampler(Sampler):
   """Bellman-Ford sampler."""
   CAN_TRUNCATE_INPUT_DATA = True
@@ -844,6 +868,7 @@ SAMPLERS = {
     'bfs': BfsSampler,
     'mst_kruskal': MSTSampler,
     'mst_prim': BellmanFordSampler,
+    'minimum_edge': MinimumEdgeSampler,
     'bellman_ford': BellmanFordSampler,
     'dag_shortest_paths': DAGPathSampler,
     'dijkstra': BellmanFordSampler,

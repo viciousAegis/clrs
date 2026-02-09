@@ -98,12 +98,13 @@ class MLP(hk.Module):
     return x
 
 class EdgeAttention(hk.Module):
-  def __init__(self, d_model, num_heads, dropout):
+  def __init__(self, d_model, num_heads, dropout, logit_scale: float = 1.0):
     super().__init__(name="EdgeAttention")
     self.rate = dropout 
     self.d_model = d_model
     self.num_heads = num_heads
     self.d_k = d_model // num_heads
+    self.logit_scale = logit_scale
 
   def __call__(
       self,
@@ -134,6 +135,7 @@ class EdgeAttention(hk.Module):
     scores = jnp.einsum("bxahd,bayhd->bxayh", left_k, right_k) / jnp.sqrt(
         self.d_k
     )
+    scores = scores * self.logit_scale
 
     if mask is not None:
         scores_dtype = scores.dtype
@@ -207,6 +209,7 @@ class EdgeTransformerLayer(hk.Module):
       attention_dropout: float,
       activation: str = 'relu',
       norm_first: bool = False,
+      logit_scale: float = 1.0,
   ):
     super().__init__(name="ET_Layer")
     self.embed_dim = embed_dim
@@ -215,6 +218,7 @@ class EdgeTransformerLayer(hk.Module):
     self.attention_dropout = attention_dropout
     self.activation = activation
     self.norm_first = norm_first
+    self.logit_scale = logit_scale
 
   def __call__(
       self,
@@ -223,7 +227,12 @@ class EdgeTransformerLayer(hk.Module):
       is_training=False,
       return_attention: bool = False,
   ):
-    attention = EdgeAttention(self.embed_dim, self.num_heads, self.attention_dropout)
+    attention = EdgeAttention(
+        self.embed_dim,
+        self.num_heads,
+        self.attention_dropout,
+        logit_scale=self.logit_scale,
+    )
     ffn = FFN(self.embed_dim, self.dropout, self.activation, 'layer')
     x = x_in
 
@@ -261,6 +270,7 @@ class EdgeTransformer(hk.Module):
       use_ln: bool = False,
       activation: str = 'relu',
       norm_first: bool = False,
+      logit_scale: float = 1.0,
   ):
     super().__init__(name="EdgeTransformer")
     self.out_size = out_size
@@ -272,6 +282,7 @@ class EdgeTransformer(hk.Module):
     self.num_layers = num_layers
     self.activation = activation
     self.norm_first = norm_first
+    self.logit_scale = logit_scale
 
     if out_size % nb_heads != 0:
       raise ValueError('The number of attention heads must divide the width!')
@@ -287,6 +298,7 @@ class EdgeTransformer(hk.Module):
           attention_dropout=self.attention_dropout,
           activation=self.activation,
           norm_first=self.norm_first,
+          logit_scale=self.logit_scale,
       )
       if return_attention:
         x, att = layer(x, is_training=is_training, return_attention=True)
@@ -310,6 +322,7 @@ class ET_Processor(Processor):
       use_ln: bool = False,
       name: str = 'edge_t',
       norm_first: bool = False,
+      logit_scale: float = 1.0,
   ):
     super().__init__(name=name)
 
@@ -321,6 +334,7 @@ class ET_Processor(Processor):
     self.num_layers = num_layers
     self.activation = activation
     self.norm_first = norm_first
+    self.logit_scale = logit_scale
 
   def __call__(
       self,
@@ -345,6 +359,7 @@ class ET_Processor(Processor):
         num_layers=self.num_layers,
         activation=self.activation,
         norm_first=self.norm_first,
+        logit_scale=self.logit_scale,
     )
 
     b, n, _ = node_fts.shape
@@ -1055,13 +1070,361 @@ class MemNetFull(MemNetMasked):
     return super().__call__(node_fts, edge_fts, graph_fts, adj_mat, hidden)
 
 
+class NodeAttention(hk.Module):
+  """Multi-head attention on nodes (Graph Transformer style)."""
+
+  def __init__(self, d_model, num_heads, dropout):
+    super().__init__(name="NodeAttention")
+    self.rate = dropout
+    self.d_model = d_model
+    self.num_heads = num_heads
+    self.d_k = d_model // num_heads
+
+  def __call__(
+      self,
+      query,
+      key,
+      value,
+      edge_fts=None,
+      mask=None,
+      is_training=False,
+      return_attention: bool = False,
+  ):
+    """Node-to-node attention with optional edge modulation.
+    
+    Args:
+      query: [B, N, D] node features for query
+      key: [B, N, D] node features for key
+      value: [B, N, D] node features for value
+      edge_fts: [B, N, N, D_edge] edge features (optional for modulation)
+      mask: [B, N, N] adjacency mask
+      is_training: whether in training mode
+      return_attention: whether to return attention weights
+      
+    Returns:
+      output: [B, N, D] aggregated output
+      attention (optional): [B, N, N, H] attention weights
+    """
+    linears = [hk.Linear(self.d_model, with_bias=False) for _ in range(4)]
+    b, n, d = query.shape
+    
+    Q = linears[0](query)  # [B, N, D]
+    K = linears[1](key)    # [B, N, D]
+    V = linears[2](value)  # [B, N, D]
+    
+    # Reshape for multi-head: [B, N, H, D/H]
+    Q = Q.reshape((b, n, self.num_heads, self.d_k))
+    K = K.reshape((b, n, self.num_heads, self.d_k))
+    V = V.reshape((b, n, self.num_heads, self.d_k))
+    
+    # Transpose to [B, H, N, D/H]
+    Q = jnp.transpose(Q, (0, 2, 1, 3))
+    K = jnp.transpose(K, (0, 2, 1, 3))
+    V = jnp.transpose(V, (0, 2, 1, 3))
+    
+    # Scaled dot-product attention: [B, H, N, N]
+    scores = jnp.einsum("bhid,bhjd->bhij", Q, K) / jnp.sqrt(self.d_k)
+    
+    # Apply edge features as bias if provided
+    if edge_fts is not None:
+      edge_bias = hk.Linear(self.num_heads, with_bias=False)(edge_fts)  # [B, N, N, H]
+      edge_bias = jnp.transpose(edge_bias, (0, 3, 1, 2))  # [B, H, N, N]
+      scores = scores + edge_bias
+    
+    # Apply mask
+    if mask is not None:
+      scores_dtype = scores.dtype
+      scores = scores.astype(jnp.float32)
+      scores = scores.at[:, :, ~mask[0]].set(-1e9)
+      scores = scores.astype(scores_dtype)
+    
+    # Softmax attention
+    att = jax.nn.softmax(scores, axis=-1)  # [B, H, N, N]
+    if is_training:
+      att = hk.dropout(hk.next_rng_key(), self.rate, att)
+    
+    # Apply attention to values: [B, H, N, D/H]
+    out = jnp.einsum("bhij,bhjd->bhid", att, V)
+    
+    # Transpose back: [B, N, H, D/H]
+    out = jnp.transpose(out, (0, 2, 1, 3))
+    
+    # Reshape: [B, N, D]
+    out = out.reshape((b, n, self.d_model))
+    
+    # Final linear projection
+    out = linears[3](out)
+    
+    if return_attention:
+      return out, att
+    return out
+
+
+class GraphTransformerLayer(hk.Module):
+  """Graph Transformer layer with node attention and edge features."""
+
+  def __init__(
+      self,
+      embed_dim: int,
+      num_heads: int,
+      dropout: float,
+      attention_dropout: float,
+      activation: str = 'relu',
+      norm_first: bool = False,
+  ):
+    super().__init__(name="GT_Layer")
+    self.embed_dim = embed_dim
+    self.num_heads = num_heads
+    self.dropout = dropout
+    self.attention_dropout = attention_dropout
+    self.activation = activation
+    self.norm_first = norm_first
+
+  def __call__(
+      self,
+      x_in,
+      edge_fts=None,
+      mask=None,
+      is_training=False,
+      return_attention: bool = False,
+  ):
+    attention = NodeAttention(self.embed_dim, self.num_heads, self.attention_dropout)
+    ffn = FFN(self.embed_dim, self.dropout, self.activation, 'layer')
+    x = x_in
+
+    if self.norm_first:
+      x = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)(x)
+
+    # Node attention with edge modulation
+    attention_out = attention(
+        x, x, x, edge_fts=edge_fts, mask=mask,
+        is_training=is_training, return_attention=return_attention
+    )
+
+    if return_attention:
+      x_upd, att = attention_out
+    else:
+      x_upd = attention_out
+
+    x = ffn(x_in, x_upd, is_training=is_training)
+    if return_attention:
+      return x, att
+    return x
+
+
+class GraphTransformer(hk.Module):
+  """Graph Transformer with multi-head node attention and edge features."""
+
+  def __init__(
+      self,
+      out_size: int,
+      nb_heads: int,
+      num_layers: int = 5,
+      dropout: float = 0.0,
+      attention_dropout: float = 0.0,
+      activation: str = 'relu',
+      norm_first: bool = False,
+  ):
+    super().__init__(name="GraphTransformer")
+    self.out_size = out_size
+    self.nb_heads = nb_heads
+    self.dropout = dropout
+    self.attention_dropout = attention_dropout
+    self.num_layers = num_layers
+    self.activation = activation
+    self.norm_first = norm_first
+
+    if out_size % nb_heads != 0:
+      raise ValueError('The number of attention heads must divide the width!')
+
+  def __call__(
+      self,
+      x,
+      edge_fts=None,
+      mask=None,
+      is_training=False,
+      return_attention: bool = False,
+  ):
+    """GraphTransformer inference step."""
+    attentions = []
+    for _ in range(self.num_layers):
+      layer = GraphTransformerLayer(
+          embed_dim=self.out_size,
+          num_heads=self.nb_heads,
+          dropout=self.dropout,
+          attention_dropout=self.attention_dropout,
+          activation=self.activation,
+          norm_first=self.norm_first,
+      )
+      if return_attention:
+        x, att = layer(x, edge_fts=edge_fts, mask=mask,
+                      is_training=is_training, return_attention=True)
+        attentions.append(att)
+      else:
+        x = layer(x, edge_fts=edge_fts, mask=mask,
+                 is_training=is_training)
+    if return_attention:
+      return x, attentions
+    return x
+
+
+class GT_Processor(Processor):
+  """Graph Transformer Processor with node attention, edge features, and Laplacian PE."""
+
+  def __init__(
+      self,
+      out_size: int,
+      nb_heads: int,
+      num_layers: int,
+      activation: str = 'relu',
+      dropout: float = 0.0,
+      attention_dropout: float = 0.0,
+      use_ln: bool = False,
+      name: str = 'graph_t',
+      norm_first: bool = False,
+      num_pe: int = 8,
+  ):
+    super().__init__(name=name)
+    self.out_size = out_size
+    self.nb_heads = nb_heads
+    self.dropout = dropout
+    self.attention_dropout = attention_dropout
+    self.num_layers = num_layers
+    self.activation = activation
+    self.norm_first = norm_first
+    self.use_ln = use_ln
+    self.num_pe = num_pe  # Number of Laplacian eigenvectors to use
+
+  def _compute_laplacian_pe(self, adj_mat: _Array) -> _Array:
+    """Compute Laplacian eigenvector positional encodings.
+    
+    Args:
+      adj_mat: [B, N, N] adjacency matrix
+      
+    Returns:
+      [B, N, num_pe] Laplacian eigenvector features
+    """
+    b, n, _ = adj_mat.shape
+    
+    # Compute degree matrix: D = diag(sum(A, axis=1))
+    degree = jnp.sum(adj_mat, axis=-1)  # [B, N]
+    degree_mat = jnp.diag(degree[0])  # [N, N] (use first batch as proxy)
+    
+    # For efficiency, compute per-first-batch. In practice, graphs in CLRS batches
+    # have similar structure. For exact per-batch computation:
+    degree_mats = jax.vmap(lambda d: jnp.diag(d))(degree)  # [B, N, N]
+    
+    # Compute Laplacian: L = D - A
+    laplacian = degree_mats - adj_mat  # [B, N, N]
+    
+    # Compute eigendecomposition: L = U * Lambda * U^T
+    # jnp.linalg.eigh returns eigenvalues and eigenvectors in ascending order
+    eigenvalues, eigenvectors = jax.vmap(jnp.linalg.eigh)(laplacian)
+    # eigenvalues: [B, N], eigenvectors: [B, N, N]
+    
+    # Use the first num_pe eigenvectors (corresponding to smallest eigenvalues)
+    # Skip the first one (always 0 for connected graphs) if desired, or include all
+    num_pe_actual = min(self.num_pe, n)
+    pe = eigenvectors[:, :, :num_pe_actual]  # [B, N, num_pe]
+    
+    # Pad if num_pe > n
+    if num_pe_actual < self.num_pe:
+      pad_width = ((0, 0), (0, 0), (0, self.num_pe - num_pe_actual))
+      pe = jnp.pad(pe, pad_width, mode='constant', constant_values=0.0)
+    
+    return pe
+
+  def __call__(
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      return_attention: bool = False,
+      **kwargs,
+  ) -> Tuple[_Array, Optional[_Array]]:
+    """GraphTransformer inference step with Laplacian PE."""
+
+    b, n, _ = node_fts.shape
+    assert edge_fts.shape[:-1] == (b, n, n)
+    assert graph_fts.shape[:-1] == (b,)
+    assert adj_mat.shape == (b, n, n)
+    
+    is_training = not kwargs['repred']
+    is_graph_fts_avail = kwargs["is_graph_fts_avail"]
+
+    # Compute Laplacian positional encodings
+    laplacian_pe = self._compute_laplacian_pe(adj_mat)  # [B, N, num_pe]
+    
+    # Concatenate node features with hidden state
+    z = jnp.concatenate([node_fts, hidden], axis=-1)
+    
+    # Add Laplacian PE to node features
+    z = jnp.concatenate([z, laplacian_pe], axis=-1)
+    
+    # Project to output dimension
+    node_proj = hk.Linear(self.out_size)
+    z = node_proj(z)
+
+    # Optionally add graph features
+    if is_graph_fts_avail:
+      graph_fts_tiled = jnp.tile(jnp.expand_dims(graph_fts, -2), (1, n, 1))
+      z = jnp.concatenate([z, graph_fts_tiled], axis=-1)
+      z = hk.Linear(self.out_size)(z)
+
+    # Create edge feature input: project edge_fts to embed_dim
+    edge_proj = hk.Linear(self.out_size)
+    edge_fts_proj = edge_proj(edge_fts)
+
+    # Apply mask based on adjacency
+    mask = adj_mat.astype(bool)  # [B, N, N]
+
+    # Graph Transformer layers
+    transformer = GraphTransformer(
+        out_size=self.out_size,
+        nb_heads=self.nb_heads,
+        num_layers=self.num_layers,
+        dropout=self.dropout,
+        attention_dropout=self.attention_dropout,
+        activation=self.activation,
+        norm_first=self.norm_first,
+    )
+
+    transformer_out = transformer(
+        z,
+        edge_fts=edge_fts_proj,
+        mask=mask,
+        is_training=is_training,
+        return_attention=return_attention,
+    )
+
+    if return_attention:
+      z_out, attentions = transformer_out
+    else:
+      z_out = transformer_out
+
+    # Aggregate output: take mean over edge dimension (node-to-node attention)
+    # Attention shape: [B, H, N, N] -> average over last dim for node embedding
+    z_out_agg = jnp.mean(z_out, axis=-2)  # [B, N, D]
+
+    if self.use_ln:
+      ln = hk.LayerNorm(axis=-1, create_scale=True, create_offset=True)
+      z_out_agg = ln(z_out_agg)
+
+    if return_attention:
+      return z_out_agg, edge_fts_proj, attentions
+    return z_out_agg, edge_fts_proj
+
+
 ProcessorFactory = Callable[[int], Processor]
 
 
 def get_processor_factory(kind: str,
                           use_ln: bool,
                           nb_triplet_fts: int,
-                          nb_heads: Optional[int] = None) -> ProcessorFactory:
+                          nb_heads: Optional[int] = None,
+                          attention_logit_scale: float = 1.0) -> ProcessorFactory:
   """Returns a processor factory.
 
   Args:
@@ -1228,6 +1591,28 @@ def get_processor_factory(kind: str,
       )
     elif kind == 'edge_t':
       processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+      )
+    elif kind == 'edge_t_scaled':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=attention_logit_scale,
+      )
+    elif kind == 'graph_t':
+      processor = GT_Processor(
           out_size=out_size,
           nb_heads=nb_heads,
           use_ln=use_ln,

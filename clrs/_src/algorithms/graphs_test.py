@@ -86,6 +86,13 @@ WEIGHTED_UNDIRECTED = np.array([
     [X, 2, 1, 5, X],
 ])
 
+WEIGHTED_MIN_EDGE = np.array([
+    [0, 3, 0, 5],
+    [3, 0, 2, 0],
+    [0, 2, 0, 4],
+    [5, 0, 4, 0],
+])
+
 
 # Bipartite graphs.
 
@@ -179,6 +186,16 @@ class GraphsTest(absltest.TestCase):
   def test_mst_prim(self):
     expected = np.array([0, 0, 1, 1, 2])
     out, _ = graphs.mst_prim(WEIGHTED_UNDIRECTED, 0)
+    np.testing.assert_array_equal(expected, out)
+
+  def test_minimum_edge(self):
+    expected = np.array([
+        [-1, 0, -1, 0],
+        [0, -1, 1, -1],
+        [-1, 1, -1, 0],
+        [0, -1, 0, -1],
+    ])
+    out, _ = graphs.minimum_edge(WEIGHTED_MIN_EDGE)
     np.testing.assert_array_equal(expected, out)
 
   def test_bellman_ford(self):

@@ -24,6 +24,7 @@ Currently implements the following:
 - Kosaraju's strongly-connected components (Aho et al., 1974)
 - Kruskal's minimum spanning tree (Kruskal, 1956)
 - Prim's minimum spanning tree (Prim, 1957)
+- Minimum edge selection
 - Bellman-Ford's single-source shortest path (Bellman, 1958)
 - Dijkstra's single-source shortest path (Dijkstra, 1959)
 - DAG shortest path
@@ -1142,6 +1143,92 @@ def mst_prim(A: _Array, s: int) -> _Out:
   probing.finalize(probes)
 
   return pi, probes
+
+
+def minimum_edge(A: _Array) -> _Out:
+  """Selects the minimum-weight edge."""
+
+  chex.assert_rank(A, 2)
+  probes = probing.initialize(specs.SPECS['minimum_edge'])
+
+  A_pos = np.arange(A.shape[0])
+  adj = probing.graph(np.copy(A))
+  edge_mask = (A != 0).astype(float)
+  np.fill_diagonal(edge_mask, 0)
+
+  probing.push(
+      probes,
+      specs.Stage.INPUT,
+      next_probe={
+          'pos': np.copy(A_pos) * 1.0 / A.shape[0],
+          'A': np.copy(A),
+          'adj': adj
+      })
+
+  base_min_edge = np.zeros_like(A) + _OutputClass.MASKED + edge_mask
+  min_edge = np.copy(base_min_edge)
+
+  edges = []
+  for i in range(A.shape[0]):
+    for j in range(i + 1, A.shape[0]):
+      if edge_mask[i, j] == 1:
+        edges.append((i, j))
+
+  if not edges:
+    probing.push(
+        probes,
+        specs.Stage.HINT,
+        next_probe={
+            'min_h': np.copy(min_edge),
+            'u': probing.mask_one(0, A.shape[0]),
+            'v': probing.mask_one(0, A.shape[0]),
+        })
+    probing.push(
+        probes,
+        specs.Stage.OUTPUT,
+        next_probe={'min_edge': np.copy(min_edge)},
+    )
+    probing.finalize(probes)
+    return min_edge, probes
+
+  min_u, min_v = edges[0]
+  min_w = A[min_u, min_v]
+  min_edge[min_u, min_v] = 1
+  min_edge[min_v, min_u] = 1
+
+  probing.push(
+      probes,
+      specs.Stage.HINT,
+      next_probe={
+          'min_h': np.copy(min_edge),
+          'u': probing.mask_one(min_u, A.shape[0]),
+          'v': probing.mask_one(min_v, A.shape[0]),
+      })
+
+  for u, v in edges[1:]:
+    if A[u, v] < min_w:
+      min_w = A[u, v]
+      min_edge = np.copy(base_min_edge)
+      min_edge[u, v] = 1
+      min_edge[v, u] = 1
+
+    probing.push(
+        probes,
+        specs.Stage.HINT,
+        next_probe={
+            'min_h': np.copy(min_edge),
+            'u': probing.mask_one(u, A.shape[0]),
+            'v': probing.mask_one(v, A.shape[0]),
+        })
+
+  probing.push(
+      probes,
+      specs.Stage.OUTPUT,
+      next_probe={'min_edge': np.copy(min_edge)},
+  )
+  probing.finalize(probes)
+
+  return min_edge, probes
 
 
 def bellman_ford(A: _Array, s: int) -> _Out:

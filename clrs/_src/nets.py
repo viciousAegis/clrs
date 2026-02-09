@@ -51,6 +51,7 @@ class _MessagePassingScanState:
   hiddens: chex.Array
   lstm_state: Optional[hk.LSTMState]
   attention_entropy: chex.Array
+  attention_stats: Optional[Dict[str, chex.Array]] = None
 
 
 @chex.dataclass
@@ -177,7 +178,7 @@ class Net(hk.Module):
             probing.DataPoint(
                 name=hint.name, location=loc, type_=typ, data=hint_data))
 
-    hiddens, output_preds_cand, hint_preds, lstm_state, attention_entropy = (
+    hiddens, output_preds_cand, hint_preds, lstm_state, attention_stats = (
         self._one_step_pred(
             inputs, cur_hint, mp_state.hiddens,
             batch_size, nb_nodes, mp_state.lstm_state,
@@ -194,21 +195,28 @@ class Net(hk.Module):
         output_preds[outp] = is_not_done * output_preds_cand[outp] + (
             1.0 - is_not_done) * mp_state.output_preds[outp]
 
+    attention_entropy = (
+        attention_stats['entropy_mean']
+        if return_attention_entropy and attention_stats is not None
+        else jnp.asarray(jnp.nan))
+
     new_mp_state = _MessagePassingScanState(  # pytype: disable=wrong-arg-types  # numpy-scalars
         hint_preds=hint_preds,
         output_preds=output_preds,
         hiddens=hiddens,
         lstm_state=lstm_state,
-      attention_entropy=jnp.asarray(attention_entropy))
+        attention_entropy=jnp.asarray(attention_entropy),
+        attention_stats=(attention_stats if return_attention_entropy else None))
     # Save memory by not stacking unnecessary fields
     accum_mp_state = _MessagePassingScanState(  # pytype: disable=wrong-arg-types  # numpy-scalars
         hint_preds=hint_preds if return_hints else None,
         output_preds=output_preds if return_all_outputs else None,
         hiddens=hiddens if self.debug else None,
         lstm_state=None,
-      attention_entropy=(jnp.asarray(attention_entropy)
-                 if return_attention_entropy
-                 else jnp.asarray(jnp.nan)))
+        attention_entropy=(jnp.asarray(attention_entropy)
+                           if return_attention_entropy
+                           else jnp.asarray(jnp.nan)),
+        attention_stats=(attention_stats if return_attention_entropy else None))
 
     # Complying to jax.scan, the first returned value is the state we carry over
     # the second value is the output that will be stacked over steps.
@@ -295,7 +303,8 @@ class Net(hk.Module):
       mp_state = _MessagePassingScanState(  # pytype: disable=wrong-arg-types  # numpy-scalars
           hint_preds=None, output_preds=None,
           hiddens=hiddens, lstm_state=lstm_state,
-          attention_entropy=jnp.nan)
+          attention_entropy=jnp.nan,
+          attention_stats=None)
 
       # Do the first step outside of the scan because it has a different
       # computation graph.
@@ -312,7 +321,7 @@ class Net(hk.Module):
           return_hints=return_hints,
           return_all_outputs=return_all_outputs,
           is_graph_fts_avail=graph_fts_avail,
-            return_attention_entropy=return_attention_entropy,
+          return_attention_entropy=return_attention_entropy,
           )
       mp_state, lean_mp_state = self._msg_passing_step(
           mp_state,
@@ -352,18 +361,20 @@ class Net(hk.Module):
       output_preds = output_mp_state.output_preds
     hint_preds = invert(accum_mp_state.hint_preds)
 
-    attention_entropy = None
+    attention_stats = None
     if return_attention_entropy:
-      attention_entropy = jnp.mean(accum_mp_state.attention_entropy)
+      attention_stats = jax.tree_util.tree_map(
+          lambda x: jnp.mean(x, axis=0),
+          accum_mp_state.attention_stats)
 
     if self.debug:
       hiddens = jnp.stack([v for v in accum_mp_state.hiddens])
       if return_attention_entropy:
-        return output_preds, hint_preds, hiddens, attention_entropy
+        return output_preds, hint_preds, hiddens, attention_stats
       return output_preds, hint_preds, hiddens
 
     if return_attention_entropy:
-      return output_preds, hint_preds, attention_entropy
+      return output_preds, hint_preds, attention_stats
 
     return output_preds, hint_preds
 
@@ -447,7 +458,7 @@ class Net(hk.Module):
 
     # PROCESS ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     nxt_hidden = hidden
-    attention_entropy = jnp.asarray(jnp.nan)
+    attention_stats = None
     for _ in range(self.nb_msg_passing_steps):
       processor_out = self.processor(
           node_fts,
@@ -468,7 +479,7 @@ class Net(hk.Module):
         else:
           nxt_hidden, nxt_edge = processor_out
           attentions = None
-        attention_entropy = _attention_entropy(attentions)
+        attention_stats = _attention_stats(attentions)
       else:
         nxt_hidden, nxt_edge = processor_out
 
@@ -502,26 +513,106 @@ class Net(hk.Module):
         repred=repred,
     )
 
-    return nxt_hidden, output_preds, hint_preds, nxt_lstm_state, attention_entropy
+    return nxt_hidden, output_preds, hint_preds, nxt_lstm_state, attention_stats
 
 
-def _attention_entropy(attentions: Optional[List[chex.Array]]) -> chex.Array:
-  """Compute mean attention entropy across layers.
+def _attention_stats(attentions: Optional[List[chex.Array]]) -> Dict[str, chex.Array]:
+  """Compute attention sharpness statistics across layers and heads.
 
-  Returns NaN if attention weights are unavailable.
+  Handles both rank-5 (EdgeTransformer: [B, N, N, N, H]) and 
+  rank-4 (GraphTransformer: [B, H, N, N]) attention tensors.
+  Returns NaNs if attention weights are unavailable.
   """
-  if attentions is None:
-    return jnp.asarray(jnp.nan)
-  entropies = []
+  nan = jnp.asarray(jnp.nan)
+  empty = {
+      'entropy_mean': nan,
+      'entropy_per_layer_head': nan,
+      'neff_mean': nan,
+      'neff_per_layer_head': nan,
+      'top1_mass_mean': nan,
+      'top1_mass_per_layer_head': nan,
+      'top2_mass_mean': nan,
+      'top2_mass_per_layer_head': nan,
+      'top4_mass_mean': nan,
+      'top4_mass_per_layer_head': nan,
+  }
+  if attentions is None or not attentions:
+    return empty
+
+  def _standardize_attention(att: chex.Array) -> Optional[chex.Array]:
+    if att.ndim == 5:
+      # EdgeTransformer: [B, N, N, N, H] -> move head to axis 1, key axis to last.
+      att = jnp.moveaxis(att, -1, 1)  # [B, H, N, N, N]
+      key_axis = 3
+    elif att.ndim == 4:
+      # GraphTransformer: [B, H, N, N], key axis is last.
+      key_axis = -1
+    else:
+      return None
+    if key_axis != att.ndim - 1:
+      att = jnp.moveaxis(att, key_axis, -1)
+    return att
+
+  def _mean_except_head(x: chex.Array) -> chex.Array:
+    axes = tuple(i for i in range(x.ndim) if i != 1)
+    return jnp.mean(x, axis=axes)
+
+  entropy_per_layer_head = []
+  top1_per_layer_head = []
+  top2_per_layer_head = []
+  top4_per_layer_head = []
+
   for att in attentions:
-    if att.ndim != 5:
-      return jnp.asarray(jnp.nan)
     att = jnp.clip(att, 1e-12, 1.0)
-    entropy = -jnp.sum(att * jnp.log(att), axis=2)
-    entropies.append(jnp.mean(entropy))
-  if not entropies:
-    return jnp.asarray(jnp.nan)
-  return jnp.mean(jnp.stack(entropies))
+    att = _standardize_attention(att)
+    if att is None:
+      return empty
+
+    entropy = -jnp.sum(att * jnp.log(att), axis=-1)
+    entropy_per_head = _mean_except_head(entropy)
+
+    key_len = att.shape[-1]
+    k1 = 1
+    k2 = 2 if key_len >= 2 else 1
+    k4 = 4 if key_len >= 4 else key_len
+
+    top1_vals, _ = jax.lax.top_k(att, k1)
+    top1_mass = jnp.sum(top1_vals, axis=-1)
+
+    top2_vals, _ = jax.lax.top_k(att, k2)
+    top2_mass = jnp.sum(top2_vals, axis=-1)
+
+    top4_vals, _ = jax.lax.top_k(att, k4)
+    top4_mass = jnp.sum(top4_vals, axis=-1)
+
+    top1_per_head = _mean_except_head(top1_mass)
+    top2_per_head = _mean_except_head(top2_mass)
+    top4_per_head = _mean_except_head(top4_mass)
+
+    entropy_per_layer_head.append(entropy_per_head)
+    top1_per_layer_head.append(top1_per_head)
+    top2_per_layer_head.append(top2_per_head)
+    top4_per_layer_head.append(top4_per_head)
+
+  entropy_per_layer_head = jnp.stack(entropy_per_layer_head, axis=0)
+  top1_per_layer_head = jnp.stack(top1_per_layer_head, axis=0)
+  top2_per_layer_head = jnp.stack(top2_per_layer_head, axis=0)
+  top4_per_layer_head = jnp.stack(top4_per_layer_head, axis=0)
+
+  neff_per_layer_head = jnp.exp(entropy_per_layer_head)
+
+  return {
+      'entropy_mean': jnp.mean(entropy_per_layer_head),
+      'entropy_per_layer_head': entropy_per_layer_head,
+      'neff_mean': jnp.mean(neff_per_layer_head),
+      'neff_per_layer_head': neff_per_layer_head,
+      'top1_mass_mean': jnp.mean(top1_per_layer_head),
+      'top1_mass_per_layer_head': top1_per_layer_head,
+      'top2_mass_mean': jnp.mean(top2_per_layer_head),
+      'top2_mass_per_layer_head': top2_per_layer_head,
+      'top4_mass_mean': jnp.mean(top4_per_layer_head),
+      'top4_mass_per_layer_head': top4_per_layer_head,
+  }
 
 
 class NetChunked(Net):
