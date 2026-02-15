@@ -50,6 +50,8 @@ flags.DEFINE_integer('seed', 42, 'Random seed to set')
 flags.DEFINE_boolean('test_only', False, "Whether to only run evaluation on test set.")
 flags.DEFINE_boolean('return_attention_entropy', False,
                      'Whether to compute attention entropy during evaluation.')
+flags.DEFINE_boolean('return_output_entropy', False,
+                     'Whether to compute output entropy during evaluation.')
 
 flags.DEFINE_boolean('random_pos', True,
                      'Randomize the pos input common to all algos.')
@@ -314,12 +316,14 @@ def _log_attention_heatmap(prefix: str, metric_name: str, values: np.ndarray):
 
 
 def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
-                     return_attention_entropy: bool = False):
+                     return_attention_entropy: bool = False,
+                     return_output_entropy: bool = False):
   """Collect batches of output and hint preds and evaluate them."""
   processed_samples = 0
   preds = []
   outputs = []
   attention_stats_list = []
+  output_entropy_stats_list = []
   pbar = None
   if sample_count is not None and sample_count > 0:
     pbar = tqdm(total=sample_count)
@@ -330,15 +334,18 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
       outputs.append(feedback.outputs)
       new_rng_key, rng_key = jax.random.split(rng_key)
       pred_out = predict_fn(new_rng_key, feedback.features)
-      if return_attention_entropy and len(pred_out) in (3, 4):
-        if len(pred_out) == 3:
-          cur_preds, _, attention_stats = pred_out
-        else:
-          cur_preds, _, _, attention_stats = pred_out
-        if attention_stats is not None:
-          attention_stats_list.append(_tree_to_numpy(attention_stats))
-      else:
-        cur_preds, _ = pred_out
+      cur_preds = pred_out[0]
+      extras_out = pred_out[2:]
+      if return_attention_entropy:
+        for extra in extras_out:
+          if isinstance(extra, dict) and 'entropy_mean' in extra:
+            attention_stats_list.append(_tree_to_numpy(extra))
+            break
+      if return_output_entropy:
+        for extra in extras_out:
+          if isinstance(extra, dict) and 'output_entropy_mean' in extra:
+            output_entropy_stats_list.append(_tree_to_numpy(extra))
+            break
       preds.append(cur_preds)
       processed_samples += batch_size
       if pbar is not None:
@@ -361,6 +368,14 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
     out['attention_top2_mass_per_layer_head'] = attention_stats['top2_mass_per_layer_head']
     out['attention_top4_mass'] = float(attention_stats['top4_mass_mean'])
     out['attention_top4_mass_per_layer_head'] = attention_stats['top4_mass_per_layer_head']
+  if return_output_entropy and output_entropy_stats_list:
+    output_entropy_stats = _tree_mean(output_entropy_stats_list)
+    out['output_entropy'] = float(output_entropy_stats['output_entropy_mean'])
+    out['output_entropy_normalized'] = float(
+        output_entropy_stats['output_entropy_normalized_mean'])
+    out['output_entropy_per_output'] = output_entropy_stats['output_entropy_per_output']
+    out['output_entropy_normalized_per_output'] = (
+        output_entropy_stats['output_entropy_normalized_per_output'])
   if extras:
     out.update(extras)
   return {k: unpack(v) for k, v in out.items()}
@@ -699,10 +714,15 @@ def main(unused_argv):
         new_rng_key, rng_key = jax.random.split(rng_key)
         val_stats = collect_and_eval(
             val_samplers[algo_idx],
-            functools.partial(eval_model.predict, algorithm_index=algo_idx, is_graph_fts_avail=is_graph_fts_avail[algo_idx]),
+            functools.partial(
+                eval_model.predict,
+                algorithm_index=algo_idx,
+                is_graph_fts_avail=is_graph_fts_avail[algo_idx],
+                return_output_entropy=FLAGS.return_output_entropy),
             val_sample_counts[algo_idx],
             new_rng_key,
-            extras=common_extras)
+            extras=common_extras,
+            return_output_entropy=FLAGS.return_output_entropy)
         logging.info('(val) algo %s step %d: %s',
                      FLAGS.algorithms[algo_idx], step, val_stats)
         val_scores[algo_idx] = val_stats['score']
@@ -714,6 +734,9 @@ def main(unused_argv):
                     "step": step,
                     "val/loss": avg_loss,
                     "val/score": val_stats['score'],
+                    "val/output_entropy": val_stats.get('output_entropy', None),
+                    "val/output_entropy_normalized": val_stats.get(
+                        'output_entropy_normalized', None),
                 }
             )
         # Early stop if perfect validation accuracy reached.
@@ -775,11 +798,13 @@ def main(unused_argv):
         eval_model.predict,
         algorithm_index=algo_idx,
         is_graph_fts_avail=is_graph_fts_avail[algo_idx],
-        return_attention_entropy=FLAGS.return_attention_entropy),
+        return_attention_entropy=FLAGS.return_attention_entropy,
+        return_output_entropy=FLAGS.return_output_entropy),
         test_sample_counts[algo_idx],
         new_rng_key,
       extras=common_extras,
-      return_attention_entropy=FLAGS.return_attention_entropy)
+      return_attention_entropy=FLAGS.return_attention_entropy,
+      return_output_entropy=FLAGS.return_output_entropy)
     logging.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
     if FLAGS.wandb_project:
         wandb.log({"test/score": test_stats['score']})
@@ -788,6 +813,8 @@ def main(unused_argv):
         wandb.log({"test/attention_top1_mass": test_stats.get('attention_top1_mass', None)})
         wandb.log({"test/attention_top2_mass": test_stats.get('attention_top2_mass', None)})
         wandb.log({"test/attention_top4_mass": test_stats.get('attention_top4_mass', None)})
+        wandb.log({"test/output_entropy": test_stats.get('output_entropy', None)})
+        wandb.log({"test/output_entropy_normalized": test_stats.get('output_entropy_normalized', None)})
         _log_attention_heatmap(
             "test",
             "attention_entropy",

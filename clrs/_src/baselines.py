@@ -138,6 +138,56 @@ def _maybe_pmap_rng_key(rng_key: _Array):
   return jax.device_put_sharded(list(pmap_rng_keys), jax.local_devices())
 
 
+def _mean_normalized_entropy(spec: _Spec, output_preds: Dict[str, _Array]):
+  """Computes mean output entropy (raw and normalized) per output head."""
+  eps = 1e-12
+  per_output = {}
+  per_output_norm = {}
+
+  for name, pred in output_preds.items():
+    stage, _, t = spec[name]
+    if stage != _Stage.OUTPUT or t == _Type.SCALAR:
+      continue
+
+    if t == _Type.MASK:
+      p = jax.nn.sigmoid(pred)
+      p = jnp.clip(p, eps, 1.0 - eps)
+      entropy = -(p * jnp.log(p) + (1.0 - p) * jnp.log(1.0 - p))
+      entropy_norm = entropy / jnp.log(2.0)
+    elif t in [_Type.MASK_ONE, _Type.CATEGORICAL, _Type.POINTER]:
+      probs = jax.nn.softmax(pred, axis=-1)
+      probs = jnp.clip(probs, eps, 1.0)
+      entropy = -jnp.sum(probs * jnp.log(probs), axis=-1)
+      k = jnp.maximum(pred.shape[-1], 2)
+      entropy_norm = entropy / jnp.log(k)
+    elif t == _Type.PERMUTATION_POINTER:
+      # `pred` is already in log-space after Sinkhorn.
+      log_probs = pred
+      probs = jnp.clip(jnp.exp(log_probs), eps, 1.0)
+      entropy = -jnp.sum(probs * log_probs, axis=-1)
+      k = jnp.maximum(pred.shape[-1], 2)
+      entropy_norm = entropy / jnp.log(k)
+    else:
+      continue
+
+    per_output[name] = jnp.mean(entropy)
+    per_output_norm[name] = jnp.mean(entropy_norm)
+
+  if per_output:
+    output_entropy_mean = jnp.mean(jnp.stack(list(per_output.values())))
+    output_entropy_norm_mean = jnp.mean(jnp.stack(list(per_output_norm.values())))
+  else:
+    output_entropy_mean = jnp.nan
+    output_entropy_norm_mean = jnp.nan
+
+  return {
+      'output_entropy_mean': output_entropy_mean,
+      'output_entropy_normalized_mean': output_entropy_norm_mean,
+      'output_entropy_per_output': per_output,
+      'output_entropy_normalized_per_output': per_output_norm,
+  }
+
+
 class BaselineModel(model.Model):
   """Model implementation with selectable message passing algorithm."""
 
@@ -282,7 +332,7 @@ class BaselineModel(model.Model):
     self.jitted_feedback = func(self._feedback, donate_argnums=[0, 3],
                                 **extra_args)
     # extra_args[static_arg] = [3, 4, 5]
-    extra_args[static_arg] = [3, 4, 5, 6, 7]
+    extra_args[static_arg] = [3, 4, 5, 6, 7, 8]
     self.jitted_predict = func(self._predict, **extra_args)
     extra_args[static_arg] = [3, 4]
     self.jitted_accum_opt_update = func(accum_opt_update, donate_argnums=[0, 2],
@@ -338,7 +388,8 @@ class BaselineModel(model.Model):
   def _predict(self, params, rng_key: hk.PRNGSequence, features: _Features,
                algorithm_index: int, return_hints: bool,
                return_all_outputs: bool, is_graph_fts_avail: bool,
-               return_attention_entropy: bool = False):
+               return_attention_entropy: bool = False,
+               return_output_entropy: bool = False):
     net_outputs = self.net_fn.apply(
         params, rng_key, [features],
         repred=True, algorithm_index=algorithm_index,
@@ -355,6 +406,9 @@ class BaselineModel(model.Model):
         outs, hint_preds, attention_entropy = net_outputs
       else:
         outs, hint_preds = net_outputs
+    output_entropy = None
+    if return_output_entropy:
+      output_entropy = _mean_normalized_entropy(self._spec[algorithm_index], outs)
     outs = decoders.postprocess(self._spec[algorithm_index],
                                 outs,
                                 sinkhorn_temperature=0.1,
@@ -362,12 +416,20 @@ class BaselineModel(model.Model):
                                 hard=True,
                                 )
     if self.debug:
+      if return_attention_entropy and return_output_entropy:
+        return outs, hint_preds, hidden_states, attention_entropy, output_entropy
       if return_attention_entropy:
         return outs, hint_preds, hidden_states, attention_entropy
+      if return_output_entropy:
+        return outs, hint_preds, hidden_states, output_entropy
       return outs, hint_preds, hidden_states
     else:
+      if return_attention_entropy and return_output_entropy:
+        return outs, hint_preds, attention_entropy, output_entropy
       if return_attention_entropy:
         return outs, hint_preds, attention_entropy
+      if return_output_entropy:
+        return outs, hint_preds, output_entropy
       return outs, hint_preds
 
   def compute_grad(
@@ -412,7 +474,8 @@ class BaselineModel(model.Model):
               return_hints: bool = False,
               return_all_outputs: bool = False,
               is_graph_fts_avail: bool = False,
-              return_attention_entropy: bool = False):
+              return_attention_entropy: bool = False,
+              return_output_entropy: bool = False):
     """Model inference step."""
     if algorithm_index is None:
       assert len(self._spec) == 1
@@ -427,7 +490,8 @@ class BaselineModel(model.Model):
             return_hints,
             return_all_outputs,
           is_graph_fts_avail,
-          return_attention_entropy,))
+          return_attention_entropy,
+          return_output_entropy,))
 
   def _loss(self, params, rng_key, feedback, algorithm_index, is_graph_fts_avail):
     """Calculates model loss f(feedback; params)."""
