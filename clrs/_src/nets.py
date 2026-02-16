@@ -535,6 +535,14 @@ def _attention_stats(attentions: Optional[List[chex.Array]]) -> Dict[str, chex.A
       'top2_mass_per_layer_head': nan,
       'top4_mass_mean': nan,
       'top4_mass_per_layer_head': nan,
+      'sink_score_mean': nan,
+      'sink_score_per_layer_head': nan,
+      'diag_score_mean': nan,
+      'diag_score_per_layer_head': nan,
+      'offset_score_mean': nan,
+      'offset_score_per_layer_head': nan,
+      'offset_delta_per_layer_head': nan,
+      'pattern_id_per_layer_head': nan,
   }
   if attentions is None or not attentions:
     return empty
@@ -561,6 +569,21 @@ def _attention_stats(attentions: Optional[List[chex.Array]]) -> Dict[str, chex.A
   top1_per_layer_head = []
   top2_per_layer_head = []
   top4_per_layer_head = []
+  sink_per_layer_head = []
+  diag_per_layer_head = []
+  offset_per_layer_head = []
+  offset_delta_per_layer_head = []
+  pattern_id_per_layer_head = []
+
+  # Pattern IDs:
+  #   0: mixed/other
+  #   1: sink
+  #   2: diagonal
+  #   3: fixed offset (non-zero delta)
+  PATTERN_MIXED = jnp.asarray(0, dtype=jnp.int32)
+  PATTERN_SINK = jnp.asarray(1, dtype=jnp.int32)
+  PATTERN_DIAG = jnp.asarray(2, dtype=jnp.int32)
+  PATTERN_OFFSET = jnp.asarray(3, dtype=jnp.int32)
 
   for att in attentions:
     att = jnp.clip(att, 1e-12, 1.0)
@@ -589,15 +612,105 @@ def _attention_stats(attentions: Optional[List[chex.Array]]) -> Dict[str, chex.A
     top2_per_head = _mean_except_head(top2_mass)
     top4_per_head = _mean_except_head(top4_mass)
 
+    # For head-pattern classification we summarize attention as [H, Q, K],
+    # averaging over batch and any extra context/query axes.
+    if att.ndim < 4:
+      return empty
+    reduce_axes = tuple(i for i in range(att.ndim) if i not in (1, 2, att.ndim - 1))
+    qk_mean = jnp.mean(att, axis=reduce_axes)  # [H, Q, K]
+    q_len = qk_mean.shape[1]
+    k_len = qk_mean.shape[2]
+
+    sink_profile = jnp.mean(qk_mean, axis=1)  # [H, K]
+    sink_score = jnp.max(sink_profile, axis=1)  # [H]
+
+    if q_len == k_len:
+      diag_score = jnp.mean(
+          jnp.diagonal(qk_mean, axis1=1, axis2=2),
+          axis=1,
+      )  # [H]
+
+      deltas = jnp.arange(-(q_len - 1), q_len, dtype=jnp.int32)
+
+      def _offset_profile_one_head(qk):
+        def _delta_mass(delta):
+          q_idx = jnp.arange(q_len, dtype=jnp.int32)
+          k_idx = q_idx + delta
+          valid = (k_idx >= 0) & (k_idx < k_len)
+          safe_k = jnp.clip(k_idx, 0, k_len - 1)
+          vals = qk[q_idx, safe_k]
+          denom = jnp.maximum(jnp.sum(valid.astype(jnp.float32)), 1.0)
+          return jnp.sum(vals * valid.astype(vals.dtype)) / denom
+        return jax.vmap(_delta_mass)(deltas)
+
+      offset_profile = jax.vmap(_offset_profile_one_head)(qk_mean)  # [H, 2Q-1]
+      best_offset_idx = jnp.argmax(offset_profile, axis=1)
+      best_offset_delta = deltas[best_offset_idx]
+      best_offset_score = jnp.max(offset_profile, axis=1)
+
+      zero_idx = q_len - 1
+      nonzero_mask = jnp.arange(offset_profile.shape[1]) != zero_idx
+      offset_nonzero_profile = jnp.where(
+          nonzero_mask[None, :],
+          offset_profile,
+          -jnp.inf,
+      )
+      best_nonzero_idx = jnp.argmax(offset_nonzero_profile, axis=1)
+      best_nonzero_delta = deltas[best_nonzero_idx]
+      best_nonzero_score = jnp.max(offset_nonzero_profile, axis=1)
+    else:
+      diag_score = jnp.full((qk_mean.shape[0],), jnp.nan)
+      best_offset_score = jnp.full((qk_mean.shape[0],), jnp.nan)
+      best_nonzero_score = jnp.full((qk_mean.shape[0],), -jnp.inf)
+      best_nonzero_delta = jnp.full((qk_mean.shape[0],), jnp.nan)
+      best_offset_delta = jnp.full((qk_mean.shape[0],), jnp.nan)
+
+    # Simple, robust classifier based on strongest signature vs baseline.
+    baseline = 1.0 / float(max(k_len, 1))
+    strength_margin = 0.05
+    tie_margin = 0.03
+
+    score_stack = jnp.stack([sink_score, diag_score, best_nonzero_score], axis=1)
+    finite_stack = jnp.where(jnp.isfinite(score_stack), score_stack, -jnp.inf)
+    best_idx = jnp.argmax(finite_stack, axis=1)
+    best_score = jnp.max(finite_stack, axis=1)
+    sorted_scores = jnp.sort(finite_stack, axis=1)
+    second_score = sorted_scores[:, -2]
+    confident = (best_score >= (baseline + strength_margin)) & (
+        (best_score - second_score) >= tie_margin
+    )
+
+    pattern_map = jnp.asarray(
+        [PATTERN_SINK, PATTERN_DIAG, PATTERN_OFFSET],
+        dtype=jnp.int32,
+    )
+    predicted = pattern_map[best_idx]
+    pattern_id = jnp.where(confident, predicted, PATTERN_MIXED)
+    offset_delta = jnp.where(
+        pattern_id == PATTERN_OFFSET,
+        best_nonzero_delta.astype(jnp.float32),
+        best_offset_delta.astype(jnp.float32),
+    )
+
     entropy_per_layer_head.append(entropy_per_head)
     top1_per_layer_head.append(top1_per_head)
     top2_per_layer_head.append(top2_per_head)
     top4_per_layer_head.append(top4_per_head)
+    sink_per_layer_head.append(sink_score)
+    diag_per_layer_head.append(diag_score)
+    offset_per_layer_head.append(best_offset_score)
+    offset_delta_per_layer_head.append(offset_delta)
+    pattern_id_per_layer_head.append(pattern_id.astype(jnp.float32))
 
   entropy_per_layer_head = jnp.stack(entropy_per_layer_head, axis=0)
   top1_per_layer_head = jnp.stack(top1_per_layer_head, axis=0)
   top2_per_layer_head = jnp.stack(top2_per_layer_head, axis=0)
   top4_per_layer_head = jnp.stack(top4_per_layer_head, axis=0)
+  sink_per_layer_head = jnp.stack(sink_per_layer_head, axis=0)
+  diag_per_layer_head = jnp.stack(diag_per_layer_head, axis=0)
+  offset_per_layer_head = jnp.stack(offset_per_layer_head, axis=0)
+  offset_delta_per_layer_head = jnp.stack(offset_delta_per_layer_head, axis=0)
+  pattern_id_per_layer_head = jnp.stack(pattern_id_per_layer_head, axis=0)
 
   neff_per_layer_head = jnp.exp(entropy_per_layer_head)
 
@@ -612,6 +725,14 @@ def _attention_stats(attentions: Optional[List[chex.Array]]) -> Dict[str, chex.A
       'top2_mass_per_layer_head': top2_per_layer_head,
       'top4_mass_mean': jnp.mean(top4_per_layer_head),
       'top4_mass_per_layer_head': top4_per_layer_head,
+      'sink_score_mean': jnp.mean(sink_per_layer_head),
+      'sink_score_per_layer_head': sink_per_layer_head,
+      'diag_score_mean': jnp.nanmean(diag_per_layer_head),
+      'diag_score_per_layer_head': diag_per_layer_head,
+      'offset_score_mean': jnp.nanmean(offset_per_layer_head),
+      'offset_score_per_layer_head': offset_per_layer_head,
+      'offset_delta_per_layer_head': offset_delta_per_layer_head,
+      'pattern_id_per_layer_head': pattern_id_per_layer_head,
   }
 
 

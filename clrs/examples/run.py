@@ -50,6 +50,11 @@ flags.DEFINE_integer('seed', 42, 'Random seed to set')
 flags.DEFINE_boolean('test_only', False, "Whether to only run evaluation on test set.")
 flags.DEFINE_boolean('return_attention_entropy', False,
                      'Whether to compute attention entropy during evaluation.')
+flags.DEFINE_boolean(
+    'return_head_patterns',
+    False,
+    'Whether to classify attention head patterns (sink/diag/offset) during evaluation.',
+)
 flags.DEFINE_boolean('return_output_entropy', False,
                      'Whether to compute output entropy during evaluation.')
 
@@ -315,6 +320,85 @@ def _log_attention_heatmap(prefix: str, metric_name: str, values: np.ndarray):
     wandb.log({f"{prefix}/{metric_name}_image": wandb.Image(values)})
 
 
+def _log_head_pattern_table(
+    prefix: str,
+    pattern_ids: np.ndarray,
+    sink_scores: np.ndarray,
+    diag_scores: np.ndarray,
+    offset_scores: np.ndarray,
+    offset_deltas: np.ndarray,
+):
+  if (
+      pattern_ids is None
+      or not isinstance(pattern_ids, np.ndarray)
+      or pattern_ids.ndim != 2
+  ):
+    return
+
+  def _label_for_id(v: float) -> str:
+    try:
+      idx = int(round(float(v)))
+    except (TypeError, ValueError):
+      idx = 0
+    return {
+        0: "mixed",
+        1: "sink",
+        2: "diagonal",
+        3: "offset",
+    }.get(idx, "mixed")
+
+  n_layers, n_heads = pattern_ids.shape
+  rows = []
+  for layer in range(n_layers):
+    for head in range(n_heads):
+      pid = float(pattern_ids[layer, head])
+      sink = float(sink_scores[layer, head]) if sink_scores is not None else np.nan
+      diag = float(diag_scores[layer, head]) if diag_scores is not None else np.nan
+      offs = float(offset_scores[layer, head]) if offset_scores is not None else np.nan
+      dlt = float(offset_deltas[layer, head]) if offset_deltas is not None else np.nan
+      rows.append([
+          int(layer),
+          int(head),
+          int(round(pid)),
+          _label_for_id(pid),
+          sink,
+          diag,
+          offs,
+          dlt,
+      ])
+
+  table = wandb.Table(
+      data=rows,
+      columns=[
+          "layer",
+          "head",
+          "pattern_id",
+          "pattern_label",
+          "sink_score",
+          "diag_score",
+          "offset_score",
+          "offset_delta",
+      ],
+  )
+  wandb.log({f"{prefix}/attention_head_patterns_table": table})
+
+  if hasattr(wandb, "plot") and hasattr(wandb.plot, "heatmap"):
+    heat_table = wandb.Table(
+        data=[[r[0], r[1], r[2]] for r in rows],
+        columns=["layer", "head", "value"],
+    )
+    plot = wandb.plot.heatmap(
+        heat_table,
+        "head",
+        "layer",
+        "value",
+        title=f"{prefix}/attention_head_pattern_ids",
+    )
+    wandb.log({f"{prefix}/attention_head_pattern_ids_heatmap": plot})
+  else:
+    wandb.log({f"{prefix}/attention_head_pattern_ids_image": wandb.Image(pattern_ids)})
+
+
 def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
                      return_attention_entropy: bool = False,
                      return_output_entropy: bool = False):
@@ -368,6 +452,14 @@ def collect_and_eval(sampler, predict_fn, sample_count, rng_key, extras,
     out['attention_top2_mass_per_layer_head'] = attention_stats['top2_mass_per_layer_head']
     out['attention_top4_mass'] = float(attention_stats['top4_mass_mean'])
     out['attention_top4_mass_per_layer_head'] = attention_stats['top4_mass_per_layer_head']
+    out['attention_sink_score'] = float(attention_stats['sink_score_mean'])
+    out['attention_sink_score_per_layer_head'] = attention_stats['sink_score_per_layer_head']
+    out['attention_diag_score'] = float(attention_stats['diag_score_mean'])
+    out['attention_diag_score_per_layer_head'] = attention_stats['diag_score_per_layer_head']
+    out['attention_offset_score'] = float(attention_stats['offset_score_mean'])
+    out['attention_offset_score_per_layer_head'] = attention_stats['offset_score_per_layer_head']
+    out['attention_offset_delta_per_layer_head'] = attention_stats['offset_delta_per_layer_head']
+    out['attention_pattern_id_per_layer_head'] = attention_stats['pattern_id_per_layer_head']
   if return_output_entropy and output_entropy_stats_list:
     output_entropy_stats = _tree_mean(output_entropy_stats_list)
     out['output_entropy'] = float(output_entropy_stats['output_entropy_mean'])
@@ -792,18 +884,21 @@ def main(unused_argv):
     eval_model.restore_model(ckpt_file, only_load_processor=False)
 
     new_rng_key, rng_key = jax.random.split(rng_key)
+    need_attention_stats = (
+        FLAGS.return_attention_entropy or FLAGS.return_head_patterns
+    )
     test_stats = collect_and_eval(
         test_samplers[algo_idx],
       functools.partial(
         eval_model.predict,
         algorithm_index=algo_idx,
         is_graph_fts_avail=is_graph_fts_avail[algo_idx],
-        return_attention_entropy=FLAGS.return_attention_entropy,
+        return_attention_entropy=need_attention_stats,
         return_output_entropy=FLAGS.return_output_entropy),
         test_sample_counts[algo_idx],
         new_rng_key,
       extras=common_extras,
-      return_attention_entropy=FLAGS.return_attention_entropy,
+      return_attention_entropy=need_attention_stats,
       return_output_entropy=FLAGS.return_output_entropy)
     logging.info('(test) algo %s : %s', FLAGS.algorithms[algo_idx], test_stats)
     if FLAGS.wandb_project:
@@ -813,6 +908,9 @@ def main(unused_argv):
         wandb.log({"test/attention_top1_mass": test_stats.get('attention_top1_mass', None)})
         wandb.log({"test/attention_top2_mass": test_stats.get('attention_top2_mass', None)})
         wandb.log({"test/attention_top4_mass": test_stats.get('attention_top4_mass', None)})
+        wandb.log({"test/attention_sink_score": test_stats.get('attention_sink_score', None)})
+        wandb.log({"test/attention_diag_score": test_stats.get('attention_diag_score', None)})
+        wandb.log({"test/attention_offset_score": test_stats.get('attention_offset_score', None)})
         wandb.log({"test/output_entropy": test_stats.get('output_entropy', None)})
         wandb.log({"test/output_entropy_normalized": test_stats.get('output_entropy_normalized', None)})
         _log_attention_heatmap(
@@ -835,6 +933,34 @@ def main(unused_argv):
             "test",
             "attention_top4_mass",
             test_stats.get('attention_top4_mass_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_sink_score",
+            test_stats.get('attention_sink_score_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_diag_score",
+            test_stats.get('attention_diag_score_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_offset_score",
+            test_stats.get('attention_offset_score_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_offset_delta",
+            test_stats.get('attention_offset_delta_per_layer_head', None))
+        _log_attention_heatmap(
+            "test",
+            "attention_pattern_id",
+            test_stats.get('attention_pattern_id_per_layer_head', None))
+        _log_head_pattern_table(
+            "test",
+            test_stats.get('attention_pattern_id_per_layer_head', None),
+            test_stats.get('attention_sink_score_per_layer_head', None),
+            test_stats.get('attention_diag_score_per_layer_head', None),
+            test_stats.get('attention_offset_score_per_layer_head', None),
+            test_stats.get('attention_offset_delta_per_layer_head', None),
+        )
 
   logging.info('Done!')
 
