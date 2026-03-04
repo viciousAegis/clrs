@@ -5,6 +5,8 @@
 build/
 dist/
 venv/
+clrs_env/
+logs/
 
 # Mac OS
 .DS_Store

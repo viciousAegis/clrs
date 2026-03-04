@@ -107,10 +107,10 @@ ALGO_IDX_INPUT_NAME = 'algo_idx'
 CLRS_30_ALGS_SETTINGS = {alg: {'num_samples_multiplier': 1}
                          for alg in CLRS_30_ALGS}
 CLRS_30_ALGS_SETTINGS['find_maximum_subarray_kadane'][
-    'num_samples_multiplier'] = 32
+    'num_samples_multiplier'] = 8
 for alg in ['quickselect', 'minimum', 'binary_search', 'naive_string_matcher',
             'kmp_matcher', 'segments_intersect']:
-  CLRS_30_ALGS_SETTINGS[alg]['num_samples_multiplier'] = 64
+  CLRS_30_ALGS_SETTINGS[alg]['num_samples_multiplier'] = 8
 
 
 SPECS = types.MappingProxyType({

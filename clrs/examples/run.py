@@ -27,10 +27,16 @@ import clrs
 import jax
 import numpy as np
 import requests
+print("preparing to import tensorflow...", flush=True)
 import tensorflow as tf
 from tqdm import tqdm
 
 import wandb
+
+# Also explicitly tell TensorFlow not to use GPU
+tf.config.set_visible_devices([], 'GPU')
+
+print("✓ All imports completed successfully", flush=True)
 
 flags.DEFINE_list('algorithms', ['dijkstra'], 'Which algorithms to run.')
 flags.DEFINE_list('train_lengths', ['8'], 'Which training sizes to use. A size of -1 means '
@@ -137,8 +143,22 @@ flags.DEFINE_enum('processor_type', 'edge_t',
                    'gat', 'gatv2', 'gat_full', 'gatv2_full',
                    'gpgn', 'gpgn_mask', 'gmpnn',
                    'triplet_gpgn', 'triplet_gpgn_mask', 'triplet_gmpnn',
-                   'edge_t', 'edge_t_scaled', 'graph_t'],
+                   'linear',
+                   'edge_t', 'edge_t_gated', 'edge_t_scaled',
+                   'edge_t_adpt', 'edge_t_adpt_inc', 'edge_t_adpt_dec',
+                   'edge_t_zero',
+                   'graph_t'],
                   'Processor type to use as the network P.')
+flags.DEFINE_boolean(
+    'edge_t_adpt',
+    False,
+    'Shortcut flag to use adaptive-temperature edge transformer.',
+)
+flags.DEFINE_boolean(
+    'edge_t_zero',
+    False,
+    'Shortcut flag to use hard-attention (zero-temperature) edge transformer.',
+)
 flags.DEFINE_enum('node_readout', 'diagonal',
                   ['diagonal', 'sophisticated'],
                   'Method to extract the node features from transformer output.')
@@ -149,6 +169,11 @@ flags.DEFINE_string('dataset_path', './CLRS30',
                     'Path in which dataset is stored.')
 flags.DEFINE_boolean('freeze_processor', False,
                      'Whether to freeze the processor of the model.')
+flags.DEFINE_boolean(
+    'force_retrain',
+    False,
+    'If True, retrain even when matching checkpoints already exist.',
+)
 
 flags.DEFINE_string('wandb_entity', None,
                     'Name of `wandb` entity.')
@@ -173,6 +198,23 @@ PRED_AS_INPUT_ALGOS = [
     'naive_string_matcher',
     'kmp_matcher',
     'jarvis_march']
+
+
+def _resolve_processor_type() -> str:
+  """Resolve final processor type with optional edge transformer shortcuts."""
+  if FLAGS.edge_t_adpt and FLAGS.edge_t_zero:
+    raise ValueError('`--edge_t_adpt` and `--edge_t_zero` are mutually exclusive.')
+  if FLAGS.edge_t_adpt:
+    return 'edge_t_adpt'
+  if FLAGS.edge_t_zero:
+    return 'edge_t_zero'
+  return FLAGS.processor_type
+
+
+def _checkpoint_exists(checkpoint_path: str, algorithm: str, processor_type: str) -> bool:
+  """Returns whether a checkpoint already exists for this algorithm."""
+  ckpt = f"{algorithm}-{processor_type}-best.pkl"
+  return os.path.exists(os.path.join(checkpoint_path, ckpt))
 
 
 def unpack(v):
@@ -618,6 +660,15 @@ def create_samplers(
 
 
 def main(unused_argv):
+  print("✓ Entering main function", flush=True)
+  processor_type = _resolve_processor_type()
+  logging.info(
+      'Resolved processor type for this run: %s (processor_type=%s, edge_t_adpt=%s, edge_t_zero=%s)',
+      processor_type,
+      FLAGS.processor_type,
+      FLAGS.edge_t_adpt,
+      FLAGS.edge_t_zero,
+  )
   if FLAGS.hint_mode == 'encoded_decoded':
     encode_hints = True
     decode_hints = True
@@ -636,6 +687,7 @@ def main(unused_argv):
   rng = np.random.RandomState(FLAGS.seed)
   rng_key = jax.random.PRNGKey(rng.randint(2**32))
 
+  print("✓ Creating samplers...", flush=True)
   # Create samplers
   (
       train_samplers,
@@ -654,13 +706,15 @@ def main(unused_argv):
       train_batch_size=FLAGS.batch_size,
   )
   
+  print("✓ Samplers created successfully", flush=True)
+  
   if FLAGS.wandb_project:
     if FLAGS.ood_val:
         val_size = [32]
     else:
         val_size = [np.amax(train_lengths)]
     config = {
-      "processor": FLAGS.processor_type,
+      "processor": processor_type,
       "algorithm": FLAGS.algorithms[0],
       "activation": FLAGS.activation,
       "step_nums": FLAGS.train_steps,
@@ -676,6 +730,7 @@ def main(unused_argv):
       "ood_val": FLAGS.ood_val,
       "val_size": val_size,
       "test_only": FLAGS.test_only,
+      "force_retrain": FLAGS.force_retrain,
       "test_lengths": test_lengths[0] if test_lengths else "max_train_length",
     }
     wandb.init(
@@ -686,7 +741,7 @@ def main(unused_argv):
     )
 
   processor_factory = clrs.get_processor_factory(
-      FLAGS.processor_type,
+      processor_type,
       use_ln=FLAGS.use_ln,
       nb_triplet_fts=FLAGS.nb_triplet_fts,
       nb_heads=FLAGS.nb_heads,
@@ -731,6 +786,28 @@ def main(unused_argv):
     train_model = eval_model
 
   # Training loop.
+  should_skip_training = False
+  if not FLAGS.test_only and not FLAGS.force_retrain:
+    ckpt_presence = [
+        _checkpoint_exists(FLAGS.checkpoint_path, algo, processor_type)
+        for algo in FLAGS.algorithms
+    ]
+    if all(ckpt_presence):
+      should_skip_training = True
+      logging.info(
+          'Skipping training: checkpoints already exist for all algorithms in %s. '
+          'Use --force_retrain to train again.',
+          FLAGS.checkpoint_path,
+      )
+    else:
+      missing_algos = [
+          algo for algo, exists in zip(FLAGS.algorithms, ckpt_presence) if not exists
+      ]
+      logging.info(
+          'Training will run because checkpoints are missing for: %s',
+          ', '.join(missing_algos),
+      )
+
   best_score = -1.0
   current_train_items = [0] * len(FLAGS.algorithms)
   step = 0
@@ -744,7 +821,7 @@ def main(unused_argv):
 
   for algo_idx in range(len(train_samplers)):
     logging.info(f"{FLAGS.algorithms[algo_idx]} has graph features: {is_graph_fts_avail[algo_idx]}")
-  while step < FLAGS.train_steps:
+  while (step < FLAGS.train_steps) and (not should_skip_training):
     feedback_list = [next(t) for t in train_samplers]
 
     # Initialize model.
@@ -789,10 +866,11 @@ def main(unused_argv):
       logging.info('Algo %s step %i current loss %f, current_train_items %i.',
                    FLAGS.algorithms[algo_idx], step,
                    cur_loss, current_train_items[algo_idx])
-      wandb.log({
-          "step": step,
-          "train/loss": cur_loss,
-      })
+      if FLAGS.wandb_project: 
+        wandb.log({
+            "step": step,
+            "train/loss": cur_loss,
+        })
 
     # Periodically evaluate model
     if step >= next_eval:
@@ -857,9 +935,10 @@ def main(unused_argv):
       if (sum(val_scores) > best_score) or step == 0:
         best_score = sum(val_scores)
         logging.info('Checkpointing best model, %s', msg)
-        # Save a per-algorithm checkpoint file named "<algorithm>-best.pkl".
+        # Save a per-algorithm checkpoint file named
+        # "<algorithm>-<processor>-best.pkl".
         for algo in FLAGS.algorithms:
-          train_model.save_model(f"{algo}-best.pkl")
+          train_model.save_model(f"{algo}-{processor_type}-best.pkl")
       else:
         logging.info('Not saving new best model, %s', msg)
         
@@ -879,7 +958,19 @@ def main(unused_argv):
 
     # Restore the best checkpoint specific to this algorithm.
     algo_name = FLAGS.algorithms[algo_idx]
-    ckpt_file = f"{algo_name}-best.pkl"
+    primary_ckpt = f"{algo_name}-{processor_type}-best.pkl"
+    fallback_ckpt = f"{algo_name}-best.pkl"
+    primary_path = os.path.join(FLAGS.checkpoint_path, primary_ckpt)
+    if os.path.exists(primary_path):
+      ckpt_file = primary_ckpt
+    else:
+      ckpt_file = fallback_ckpt
+      logging.info(
+          'Checkpoint %s not found for algorithm %s. Falling back to %s.',
+          primary_ckpt,
+          algo_name,
+          fallback_ckpt,
+      )
     logging.info('Restoring checkpoint %s for algorithm %s...', ckpt_file, algo_name)
     eval_model.restore_model(ckpt_file, only_load_processor=False)
 

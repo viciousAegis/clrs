@@ -73,6 +73,32 @@ class Processor(hk.Module):
   def inf_bias_edge(self):
     return False
 
+
+class LinearProcessor(Processor):
+  """Minimal processor: project encoded node features with one linear layer."""
+
+  def __init__(self, out_size: int, name: str = 'linear'):
+    super().__init__(name=name)
+    self.out_size = out_size
+
+  def __call__(  # pytype: disable=signature-mismatch  # numpy-scalars
+      self,
+      node_fts: _Array,
+      edge_fts: _Array,
+      graph_fts: _Array,
+      adj_mat: _Array,
+      hidden: _Array,
+      **unused_kwargs,
+  ) -> Tuple[_Array, Optional[_Array]]:
+    b, n, _ = node_fts.shape
+    assert edge_fts.shape[:-1] == (b, n, n)
+    assert graph_fts.shape[:-1] == (b,)
+    assert adj_mat.shape == (b, n, n)
+    del hidden
+
+    return hk.Linear(self.out_size)(node_fts), None
+
+
 class MLP(hk.Module):
   def __init__(
       self, input_dim, output_dim, dropout: float = 0.0, linear: bool = False
@@ -98,13 +124,21 @@ class MLP(hk.Module):
     return x
 
 class EdgeAttention(hk.Module):
-  def __init__(self, d_model, num_heads, dropout, logit_scale: float = 1.0):
+  def __init__(
+      self,
+      d_model,
+      num_heads,
+      dropout,
+      logit_scale: float = 1.0,
+      attention_mode: str = 'scaled',
+  ):
     super().__init__(name="EdgeAttention")
-    self.rate = dropout 
+    self.rate = dropout
     self.d_model = d_model
     self.num_heads = num_heads
     self.d_k = d_model // num_heads
     self.logit_scale = logit_scale
+    self.attention_mode = attention_mode
 
   def __call__(
       self,
@@ -135,14 +169,45 @@ class EdgeAttention(hk.Module):
     scores = jnp.einsum("bxahd,bayhd->bxayh", left_k, right_k) / jnp.sqrt(
         self.d_k
     )
-    scores = scores * self.logit_scale
+    if self.attention_mode in (
+        'adaptive_temp',
+        'adaptive_temp_increase_only',
+        'adaptive_temp_decrease_only',
+    ):
+      # Learn per-head temperature with optional one-sided constraints.
+      temp_raw = hk.get_parameter(
+          'adaptive_temperature_raw',
+          shape=(self.num_heads,),
+          init=hk.initializers.Constant(0.0),
+      )
+      eps = 1e-6
+      if self.attention_mode == 'adaptive_temp':
+        temperature = jax.nn.softplus(temp_raw) + eps
+      elif self.attention_mode == 'adaptive_temp_increase_only':
+        temperature = 1.0 + jax.nn.softplus(temp_raw)
+      else:
+        # temperature in (0, 1], so it can only decrease from 1.0.
+        temperature = 1.0 / (1.0 + jax.nn.softplus(temp_raw) + eps)
+      inv_temperature = 1.0 / temperature
+      scores = scores * inv_temperature.reshape((1, 1, 1, 1, self.num_heads))
+    elif self.attention_mode == 'scaled':
+      scores = scores * self.logit_scale
+    elif self.attention_mode == 'hard_zero_temp':
+      pass
+    else:
+      raise ValueError(f'Unsupported attention mode: {self.attention_mode}')
 
     if mask is not None:
-        scores_dtype = scores.dtype
-        scores = scores.astype(jnp.float32).at[..., None].set(mask, -1e9).astype(scores_dtype)
+      scores_dtype = scores.dtype
+      scores = scores.astype(jnp.float32).at[..., None].set(mask, -1e9).astype(scores_dtype)
 
-    att = jax.nn.softmax(scores, axis=2)
-    if is_training:
+    if self.attention_mode == 'hard_zero_temp':
+      max_idx = jnp.argmax(scores, axis=2)
+      att = jax.nn.one_hot(max_idx, num_classes=scores.shape[2], dtype=scores.dtype)
+      att = jnp.transpose(att, (0, 1, 4, 2, 3))
+    else:
+      att = jax.nn.softmax(scores, axis=2)
+    if is_training and self.attention_mode != 'hard_zero_temp':
       att = hk.dropout(hk.next_rng_key(), self.rate, att)
 
     val = jnp.einsum("bxahd,bayhd->bxayhd", left_v, right_v)
@@ -210,6 +275,8 @@ class EdgeTransformerLayer(hk.Module):
       activation: str = 'relu',
       norm_first: bool = False,
       logit_scale: float = 1.0,
+      attention_mode: str = 'scaled',
+      use_message_gate: bool = False,
   ):
     super().__init__(name="ET_Layer")
     self.embed_dim = embed_dim
@@ -219,6 +286,8 @@ class EdgeTransformerLayer(hk.Module):
     self.activation = activation
     self.norm_first = norm_first
     self.logit_scale = logit_scale
+    self.attention_mode = attention_mode
+    self.use_message_gate = use_message_gate
 
   def __call__(
       self,
@@ -232,6 +301,7 @@ class EdgeTransformerLayer(hk.Module):
         self.num_heads,
         self.attention_dropout,
         logit_scale=self.logit_scale,
+        attention_mode=self.attention_mode,
     )
     ffn = FFN(self.embed_dim, self.dropout, self.activation, 'layer')
     x = x_in
@@ -253,6 +323,10 @@ class EdgeTransformerLayer(hk.Module):
     else:
       x_upd = attention_out
 
+    if self.use_message_gate:
+      gate = jax.nn.sigmoid(hk.Linear(self.embed_dim)(jnp.concatenate([x_in, x_upd], axis=-1)))
+      x_upd = gate * x_upd
+
     x = ffn(x_in, x_upd, is_training=is_training)
     if return_attention:
       return x, att
@@ -271,6 +345,8 @@ class EdgeTransformer(hk.Module):
       activation: str = 'relu',
       norm_first: bool = False,
       logit_scale: float = 1.0,
+      attention_mode: str = 'scaled',
+      use_message_gate: bool = False,
   ):
     super().__init__(name="EdgeTransformer")
     self.out_size = out_size
@@ -283,6 +359,8 @@ class EdgeTransformer(hk.Module):
     self.activation = activation
     self.norm_first = norm_first
     self.logit_scale = logit_scale
+    self.attention_mode = attention_mode
+    self.use_message_gate = use_message_gate
 
     if out_size % nb_heads != 0:
       raise ValueError('The number of attention heads must divide the width!')
@@ -299,6 +377,8 @@ class EdgeTransformer(hk.Module):
           activation=self.activation,
           norm_first=self.norm_first,
           logit_scale=self.logit_scale,
+          attention_mode=self.attention_mode,
+          use_message_gate=self.use_message_gate,
       )
       if return_attention:
         x, att = layer(x, is_training=is_training, return_attention=True)
@@ -323,6 +403,8 @@ class ET_Processor(Processor):
       name: str = 'edge_t',
       norm_first: bool = False,
       logit_scale: float = 1.0,
+      attention_mode: str = 'scaled',
+      use_message_gate: bool = False,
   ):
     super().__init__(name=name)
 
@@ -335,6 +417,8 @@ class ET_Processor(Processor):
     self.activation = activation
     self.norm_first = norm_first
     self.logit_scale = logit_scale
+    self.attention_mode = attention_mode
+    self.use_message_gate = use_message_gate
 
   def __call__(
       self,
@@ -360,6 +444,8 @@ class ET_Processor(Processor):
         activation=self.activation,
         norm_first=self.norm_first,
         logit_scale=self.logit_scale,
+        attention_mode=self.attention_mode,
+        use_message_gate=self.use_message_gate,
     )
 
     b, n, _ = node_fts.shape
@@ -1589,6 +1675,8 @@ def get_processor_factory(kind: str,
           nb_triplet_fts=nb_triplet_fts,
           gated=True,
       )
+    elif kind == 'linear':
+      processor = LinearProcessor(out_size=out_size)
     elif kind == 'edge_t':
       processor = ET_Processor(
           out_size=out_size,
@@ -1599,6 +1687,20 @@ def get_processor_factory(kind: str,
           attention_dropout=attention_dropout,
           norm_first=norm_first,
           logit_scale=1.0,
+          attention_mode='scaled',
+      )
+    elif kind == 'edge_t_gated':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+          attention_mode='scaled',
+          use_message_gate=True,
       )
     elif kind == 'edge_t_scaled':
       processor = ET_Processor(
@@ -1610,6 +1712,55 @@ def get_processor_factory(kind: str,
           attention_dropout=attention_dropout,
           norm_first=norm_first,
           logit_scale=attention_logit_scale,
+          attention_mode='scaled',
+      )
+    elif kind == 'edge_t_adpt':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+          attention_mode='adaptive_temp',
+      )
+    elif kind == 'edge_t_adpt_inc':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+          attention_mode='adaptive_temp_increase_only',
+      )
+    elif kind == 'edge_t_adpt_dec':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+          attention_mode='adaptive_temp_decrease_only',
+      )
+    elif kind == 'edge_t_zero':
+      processor = ET_Processor(
+          out_size=out_size,
+          nb_heads=nb_heads,
+          use_ln=use_ln,
+          num_layers=num_layers,
+          activation=activation,
+          attention_dropout=attention_dropout,
+          norm_first=norm_first,
+          logit_scale=1.0,
+          attention_mode='hard_zero_temp',
       )
     elif kind == 'graph_t':
       processor = GT_Processor(
